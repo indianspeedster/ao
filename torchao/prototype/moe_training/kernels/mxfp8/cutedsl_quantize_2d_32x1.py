@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -86,6 +86,7 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
     m_tiles_per_cta: int,
     is_full_m_tiles: bool,
     blocked_scale_output: bool,
+    offs: Optional[torch.Tensor] = None,
 ):
     """Compile the 2D MXFP8 quantization kernel using CuTeDSL for 32x1 scaling.
 
@@ -524,6 +525,7 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             m_cta_tiles: cutlass.Int64,
             k_cta_tiles: cutlass.Int64,
             blocked_scale_layout: cute.Layout,
+            offs: Optional[cute.Tensor],
             SCALE_DIM_M: cutlass.Constexpr[int],
             USE_RCEIL: cutlass.Constexpr[bool],
             IS_FULL_M_TILES: cutlass.Constexpr[bool],
@@ -555,6 +557,7 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                 m_cta_tiles: Number of tiles in M dimension
                 k_cta_tiles: Number of tile groups in K dimension
                 blocked_scale_layout: Layout for blocked scale output
+                offs: Tensor of group end offsets for validation
                 SCALE_DIM_M: Block size (32)
                 USE_RCEIL: Whether using RCEIL mode
                 IS_FULL_M_TILES: Whether M is perfectly tiled
@@ -569,6 +572,29 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             warp_idx = cute.arch.warp_idx()
             warp_idx = cute.arch.make_warp_uniform(warp_idx)
             bidx, bidy, _ = cute.arch.block_idx()
+
+            # Validate group sizes are multiples of 128 if offs is provided
+            if cutlass.const_expr(offs is not None):
+                if tidx == 0:
+                    # Only first thread validates to avoid redundant work
+                    num_groups = offs.shape[0]
+                    # Validate first group (from 0 to offs[0])
+                    if num_groups > 0:
+                        first_group_size = offs[0]
+                        cute.testing.assert_(
+                            first_group_size % 128 == 0,
+                            "Group sizes must be multiples of 128",
+                        )
+
+                    # Validate subsequent groups
+                    for i in range(1, num_groups):
+                        prev_end = offs[i - 1]
+                        curr_end = offs[i]
+                        group_size = curr_end - prev_end
+                        cute.testing.assert_(
+                            group_size % 128 == 0,
+                            "Group sizes must be multiples of 128",
+                        )
 
             smem_allocator = utils.SmemAllocator()
             storage = smem_allocator.allocate(SharedStorage)
@@ -808,6 +834,7 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
             m_cta_tiles: cutlass.Int64,
             k_cta_tiles: cutlass.Int64,
             stream: cuda.CUstream,
+            offs: Optional[cute.Tensor],
         ):
             """Kernel launcher that sets up TMA descriptors and blocked scale layout.
 
@@ -821,6 +848,7 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                 m_cta_tiles: Number of tiles in M dimension
                 k_cta_tiles: Number of tile groups in K dimension
                 stream: CUDA stream
+                offs: Tensor of group end offsets for validation (group sizes must be multiples of 128)
 
             Storage locations:
                 All tensors in global memory
@@ -888,6 +916,7 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
                 m_cta_tiles,
                 k_cta_tiles,
                 blocked_scale_layout,
+                offs,
                 SCALE_DIM_M=SCALE_DIM_M_VALUE,
                 USE_RCEIL=(scaling_mode == "rceil"),
                 IS_FULL_M_TILES=IS_FULL_M_TILES_VALUE,
@@ -935,6 +964,16 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
         )
     fake_stream = make_fake_stream()
 
+    if offs is not None:
+        offs_stride = cute.sym_int()
+        fake_offs = make_fake_tensor(
+            cutlass.Int32,
+            (cute.sym_int(),),
+            stride=(offs_stride,),
+        )
+    else:
+        fake_offs = None
+
     return cute.compile(
         kernel,
         inp_mk=fake_inp,
@@ -946,7 +985,8 @@ def _compile_mxfp8_quantize_2d_32x1_cutedsl(
         m_cta_tiles=1,
         k_cta_tiles=1,
         stream=fake_stream,
-        options="--enable-tvm-ffi",
+        offs=fake_offs,
+        options="--enable-tvm-ffi --enable-assertions",
     )
 
 
@@ -956,6 +996,7 @@ def mxfp8_quantize_cutedsl_2d_32x1(
     scaling_mode: str = "rceil",
     stage_count: int = 2,
     blocked_scale_output: bool = False,
+    offs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a 2D tensor to MXFP8 format using CuTe DSL kernel with 32x1 scaling.
@@ -968,6 +1009,7 @@ def mxfp8_quantize_cutedsl_2d_32x1(
         scaling_mode: Scaling mode ("floor" or "rceil")
         stage_count: Number of pipeline stages (1 or 2)
         blocked_scale_output: Whether to output scales in blocked layout
+        offs: Optional tensor of group end offsets for validation (must have group sizes as multiples of 128)
 
     Returns:
         q_data: Quantized data in row-major layout with shape (M, K) (no padding on data)
@@ -982,6 +1024,11 @@ def mxfp8_quantize_cutedsl_2d_32x1(
     assert block_size == 32, "Only block_size=32 is supported"
     M, K = x.shape
     assert M % block_size == 0, "M must be divisible by block_size for 32x1 scaling"
+
+    if offs is not None:
+        assert offs.is_cuda, "offs tensor must be CUDA"
+        assert offs.dtype == torch.int32, "offs must be int32 tensor"
+        assert offs.dim() == 1, "offs must be 1D tensor"
 
     _, config = _select_cutedsl_config(x.dtype, scaling_mode)
     compute_warps, tile_m, tile_k, m_tiles_per_cta = config
@@ -1038,6 +1085,7 @@ def mxfp8_quantize_cutedsl_2d_32x1(
         m_tiles_per_cta,
         is_full_m_tiles,
         blocked_scale_output,
+        offs,
     )
 
     import cuda.bindings.driver as cuda
@@ -1056,6 +1104,7 @@ def mxfp8_quantize_cutedsl_2d_32x1(
         int(m_cta_tiles),
         int(k_cta_tiles),
         stream,
+        offs,
     )
 
     return q_data, scales_u8.view(torch.float8_e8m0fnu)
