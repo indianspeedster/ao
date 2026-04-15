@@ -30,7 +30,7 @@ from torch.utils._python_dispatch import (
 )
 from torch.utils._pytree import tree_map
 
-from torchao.utils import is_ROCM, torch_version_at_least
+from torchao.utils import is_ROCM, register_as_pytree_constant, torch_version_at_least
 
 # ScalingType and SwizzleType are only available in PyTorch 2.10+
 if torch_version_at_least("2.10.0"):
@@ -94,14 +94,17 @@ EBITS_F8_E4M3, MBITS_F8_E4M3 = 4, 3
 EBITS_F8_E5M2, MBITS_F8_E5M2 = 5, 2
 
 
+@register_as_pytree_constant
 @dataclass
 class QuantizeTensorToMXKwargs(QuantizeTensorKwargs):
     elem_dtype: Union[torch.dtype, str] = torch.float8_e4m3fn
     block_size: int = 32
-    # TODO(future PR): flip the scaling_mode default to RCEIL
     scaling_mode: ScaleCalculationMode = ScaleCalculationMode.FLOOR
     kernel_preference: KernelPreference = KernelPreference.EMULATED
     is_swizzled_scales: bool = False
+
+    def __hash__(self):
+        return hash((self.elem_dtype, self.block_size, self.scaling_mode, self.kernel_preference, self.is_swizzled_scales))
 
 
 def _to_mx_rceil(

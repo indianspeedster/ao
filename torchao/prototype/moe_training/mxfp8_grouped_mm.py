@@ -1141,7 +1141,7 @@ def _compute_fwd_rocm(
 
     M = input_act_e4m3.shape[0]
     E = weight_e4m3.shape[0]
-    max_M_per_expert = (M + E - 1) // E
+    max_M_per_expert = 0
 
     return triton_mxfp8_grouped_mm(
         input_act_e4m3, weight_e4m3, input_act_scales, weight_scales,
@@ -1172,7 +1172,7 @@ def _compute_dgrad_rocm(
 
     M = grad_output_data.shape[0]
     E = weight_e4m3.shape[0]
-    max_M_per_expert = (M + E - 1) // E
+    max_M_per_expert = 0
 
     return triton_mxfp8_grouped_mm(
         grad_output_data, weight_e4m3, grad_output_scales, weight_scales,
@@ -1208,7 +1208,22 @@ def _compute_wgrad_rocm(
         )
         return grad_weight.transpose(-2, -1)
 
-    # MXFP8 wgrad: dim1-quantize both inputs, then use wgrad kernel
+    # MXFP8 wgrad: dim1-quantize both inputs, then use wgrad kernel.
+    # triton_to_mxfp8_dim1 currently requires n_rows % 128 == 0 (upstream
+    # limitation). Pad the M/token dimension when necessary; padded rows
+    # belong to no expert group so the wgrad kernel ignores them via
+    # group_end_offsets.
+    MX_ROW_ALIGN = 128
+    M_orig = grad_output.shape[0]
+    pad_rows = (-M_orig) % MX_ROW_ALIGN
+    if pad_rows > 0:
+        grad_output = torch.nn.functional.pad(
+            grad_output.contiguous(), (0, 0, 0, pad_rows)
+        )
+        input_act = torch.nn.functional.pad(
+            input_act.contiguous(), (0, 0, 0, pad_rows)
+        )
+
     go_data, go_scale = triton_to_mxfp8_dim1(
         grad_output.contiguous(), block_size, scale_calculation_mode.value
     )

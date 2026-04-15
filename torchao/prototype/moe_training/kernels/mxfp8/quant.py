@@ -260,26 +260,16 @@ def compute_blocked_scale_offsets_for_K_groups(
     return group_sizes, starting_col_after_padding
 
 
+@torch.library.custom_op("torchao::torch_pad_token_groups", mutates_args=())
 def torch_pad_token_groups(
     inputs: torch.Tensor, group_offsets: torch.Tensor, alignment_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Reference PyTorch implementation for padding token groups to alignment.
 
-    Splits input into per-group chunks and copies each chunk into a
-    pre-allocated zeroed output tensor at the aligned offsets (zero-padding
-    is implicit). Allocates upper bound size to match CUDA kernel behavior
-    (avoids sync).
-
-    Args:
-        inputs: Input tensor of shape (num_tokens, dim)
-        group_offsets: Group end offsets of shape (num_groups,)
-        alignment_size: Alignment size to pad each group to
-
-    Returns:
-        padded_tokens: Padded tokens tensor (upper bound size)
-        padded_group_start_offsets: New group start offsets after padding
-        padded_group_end_offsets: New group end offsets after padding
+    Wrapped as torch.library.custom_op so torch.compile treats the body as
+    opaque and uses the data-independent fake impl for shape inference,
+    avoiding data-dependent shape guards from .tolist() calls.
     """
     inputs = inputs.contiguous()
     num_tokens = inputs.shape[0]
@@ -323,6 +313,27 @@ def torch_pad_token_groups(
     return padded_tokens, padded_start_offsets, padded_group_end_offsets
 
 
+@torch_pad_token_groups.register_fake
+def _torch_pad_token_groups_fake(
+    inputs: torch.Tensor, group_offsets: torch.Tensor, alignment_size: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, dim = inputs.shape
+    num_groups = group_offsets.shape[0]
+    output_rows = num_tokens + num_groups * alignment_size
+    output_rows = (
+        (output_rows + alignment_size - 1) // alignment_size
+    ) * alignment_size
+    padded_tokens = inputs.new_empty((output_rows, dim))
+    padded_group_start_offsets = torch.empty(
+        (num_groups,), dtype=torch.int32, device=inputs.device
+    )
+    padded_group_end_offsets = torch.empty(
+        (num_groups,), dtype=torch.int32, device=inputs.device
+    )
+    return padded_tokens, padded_group_start_offsets, padded_group_end_offsets
+
+
+@torch.library.custom_op("torchao::torch_unpad_token_groups", mutates_args=())
 def torch_unpad_token_groups(
     padded_inputs: torch.Tensor,
     group_offsets: torch.Tensor,
@@ -371,6 +382,18 @@ def torch_unpad_token_groups(
         )
 
     return unpadded_tokens
+
+
+@torch_unpad_token_groups.register_fake
+def _torch_unpad_token_groups_fake(
+    padded_inputs: torch.Tensor,
+    group_offsets: torch.Tensor,
+    padded_group_start_offsets: torch.Tensor,
+    num_tokens: int,
+    alignment_size: int,
+) -> torch.Tensor:
+    dim = padded_inputs.shape[1]
+    return padded_inputs.new_empty((num_tokens, dim))
 
 
 if torch_version_at_least("2.7.0") and has_triton():
