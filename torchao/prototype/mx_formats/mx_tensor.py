@@ -770,22 +770,14 @@ def _addmm_mx_dispatch(
             b_qdata = b.qdata                                        # (K, N)
             a_scale_2d = a.scale.reshape(M, K // a.block_size).contiguous()
             b_scale_2d = b.scale.t().reshape(N, K // b.block_size).contiguous()
-            # Shape-aware tile selection: K=2816 (w2) benefits from BLOCK_K=256.
-            if K % 256 == 0 and K >= 2560:
-                bm, bn, bk = 256, 128, 256
-            else:
-                bm, bn, bk = 256, 256, 128
+            # Shape-aware tile + num_warps selection now lives inside
+            # triton_mxfp8_mm (_DENSE_MM_CFG + _pick_dense_cfg).
             res = triton_mxfp8_mm(
                 a_qdata,
                 b_qdata,
                 a_scale_2d,
                 b_scale_2d,
                 out_dtype=torch.bfloat16,
-                BLOCK_M=bm,
-                BLOCK_N=bn,
-                BLOCK_K=bk,
-                num_warps=8,
-                num_stages=2,
             )
             if bias is not None:
                 res = res + bias
