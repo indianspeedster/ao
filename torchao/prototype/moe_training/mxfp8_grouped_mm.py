@@ -1129,6 +1129,8 @@ def _compute_fwd_rocm(
     scale_calculation_mode: ScaleCalculationMode,
 ) -> torch.Tensor:
     from torchao.prototype.moe_training.kernels.mxfp8.rocm_mxfp8_mm import (
+        get_rocm_mxfp8_grouped_mm_config,
+        triton_mxfp8_grouped_mm_autotune,
         triton_mxfp8_grouped_mm,
     )
 
@@ -1141,12 +1143,26 @@ def _compute_fwd_rocm(
 
     M = input_act_e4m3.shape[0]
     E = weight_e4m3.shape[0]
-    max_M_per_expert = (M + E - 1) // E
+    max_M_per_expert = 0
+    kernel_cfg = get_rocm_mxfp8_grouped_mm_config(
+        K=input_act_e4m3.shape[1],
+        N=weight_e4m3.shape[1],
+    )
+
+    if input_act_e4m3.shape[1] >= 2560 and weight_e4m3.shape[1] > 4096:
+        return triton_mxfp8_grouped_mm_autotune(
+            input_act_e4m3,
+            weight_e4m3,
+            input_act_scales,
+            weight_scales,
+            padded_group_end_offsets,
+            out_dtype=out_dtype,
+        )
 
     return triton_mxfp8_grouped_mm(
         input_act_e4m3, weight_e4m3, input_act_scales, weight_scales,
         padded_group_end_offsets, out_dtype=out_dtype,
-        BLOCK_M=128, BLOCK_N=128, BLOCK_K=128,
+        **kernel_cfg,
         num_warps=8, num_stages=2, max_M_per_expert=max_M_per_expert,
     )
 
@@ -1160,6 +1176,8 @@ def _compute_dgrad_rocm(
     scale_calculation_mode: ScaleCalculationMode,
 ) -> torch.Tensor:
     from torchao.prototype.moe_training.kernels.mxfp8.rocm_mxfp8_mm import (
+        get_rocm_mxfp8_grouped_mm_config,
+        triton_mxfp8_grouped_mm_autotune,
         triton_mxfp8_grouped_mm,
     )
 
@@ -1172,12 +1190,26 @@ def _compute_dgrad_rocm(
 
     M = grad_output_data.shape[0]
     E = weight_e4m3.shape[0]
-    max_M_per_expert = (M + E - 1) // E
+    max_M_per_expert = 0
+    kernel_cfg = get_rocm_mxfp8_grouped_mm_config(
+        K=grad_output_data.shape[1],
+        N=weight_e4m3.shape[1],
+    )
+
+    if grad_output_data.shape[1] >= 2560 and weight_e4m3.shape[1] > 4096:
+        return triton_mxfp8_grouped_mm_autotune(
+            grad_output_data,
+            weight_e4m3,
+            grad_output_scales,
+            weight_scales,
+            group_end_offsets,
+            out_dtype=out_dtype,
+        )
 
     return triton_mxfp8_grouped_mm(
         grad_output_data, weight_e4m3, grad_output_scales, weight_scales,
         group_end_offsets, out_dtype=out_dtype,
-        BLOCK_M=128, BLOCK_N=128, BLOCK_K=128,
+        **kernel_cfg,
         num_warps=8, num_stages=2, max_M_per_expert=max_M_per_expert,
     )
 
@@ -1192,6 +1224,7 @@ def _compute_wgrad_rocm(
     wgrad_with_hp: bool = False,
 ) -> torch.Tensor:
     from torchao.prototype.moe_training.kernels.mxfp8.rocm_mxfp8_mm import (
+        get_rocm_mxfp8_wgrad_config,
         triton_mxfp8_wgrad,
     )
     from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim1
@@ -1215,11 +1248,16 @@ def _compute_wgrad_rocm(
     ia_data, ia_scale = triton_to_mxfp8_dim1(
         input_act.contiguous(), block_size, scale_calculation_mode.value
     )
+    kernel_cfg = get_rocm_mxfp8_wgrad_config(
+        M=go_data.shape[0],
+        K=ia_data.shape[1],
+        N=go_data.shape[1],
+    )
 
     grad_weight = triton_mxfp8_wgrad(
         go_data.t(), go_scale, ia_data.t(), ia_scale, group_end_offsets,
         out_dtype=out_dtype,
-        BLOCK_N=128, BLOCK_K=128, BLOCK_M=128,
+        **kernel_cfg,
         num_warps=8, num_stages=2,
     )
     return grad_weight.transpose(-2, -1)
