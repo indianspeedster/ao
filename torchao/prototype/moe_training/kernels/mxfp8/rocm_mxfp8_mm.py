@@ -64,14 +64,19 @@ if _rocm_mxfp8_available:
 
         m_offs = m_base + tl.arange(0, BLOCK_M)
         n_offs = n_base + tl.arange(0, BLOCK_N)
-        m_mask = m_offs < group_end
+        # Bound m_offs by both group_end AND global M, in case group_end_offsets
+        # are stale or the caller passed offsets > M.
+        m_mask = (m_offs < group_end) & (m_offs < M)
         n_mask = n_offs < N
 
         SUB_PER_BLOCK_K: tl.constexpr = BLOCK_K // SCALE_BLOCK
+        # K_SCALES = total e8m0 scale blocks along K (MXFP8 invariant: K % 32 == 0).
+        K_SCALES = K // SCALE_BLOCK
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        num_outer = K // BLOCK_K
-        for k_outer in range(0, num_outer):
+        # tl.cdiv handles the K-tail: when K % BLOCK_K != 0 the last iteration
+        # processes a partial K-block (k_mask / kb_mask zero out the tail).
+        for k_outer in range(0, tl.cdiv(K, BLOCK_K)):
             k_offs = k_outer * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = k_offs < K
 
@@ -85,13 +90,16 @@ if _rocm_mxfp8_available:
             )
 
             kb_offs = k_outer * SUB_PER_BLOCK_K + tl.arange(0, SUB_PER_BLOCK_K)
+            kb_mask = kb_offs < K_SCALES
+            # other=127: e8m0 bias-encoded 2^0 = 1.0 (neutral). Combined with
+            # data masked to 0.0, the tail contribution to dot_scaled is 0×1=0.
             a_scale = tl.load(
                 A_scales_ptr + m_offs[:, None] * A_scales_stride_m + kb_offs[None, :] * A_scales_stride_kb,
-                mask=m_mask[:, None], other=127,
+                mask=m_mask[:, None] & kb_mask[None, :], other=127,
             )
             b_scale = tl.load(
                 B_scales_ptr + pid_g * B_scales_stride_e + n_offs[:, None] * B_scales_stride_n + kb_offs[None, :] * B_scales_stride_kb,
-                mask=n_mask[:, None], other=127,
+                mask=n_mask[:, None] & kb_mask[None, :], other=127,
             )
 
             acc = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", acc=acc, out_dtype=tl.float32)
@@ -187,13 +195,17 @@ if _rocm_mxfp8_available:
         k_mask = k_offs < K
 
         SUB_PER_BLOCK_M: tl.constexpr = BLOCK_M // SCALE_BLOCK
+        # M_SCALES: total e8m0 scale blocks along M (M is multiple of 32 by
+        # MXFP8 invariant; per-group padding to BLOCK_M is enforced by the
+        # caller's pad_token_groups path).
+        M_SCALES = M // SCALE_BLOCK
         acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
 
-        num_m_iters = (M_g + BLOCK_M - 1) // BLOCK_M
-        for m_iter in range(0, num_m_iters):
+        for m_iter in range(0, tl.cdiv(M_g, BLOCK_M)):
             m_base = group_start + m_iter * BLOCK_M
             m_offs = m_base + tl.arange(0, BLOCK_M)
-            m_mask = m_offs < group_end
+            # Bound by group_end AND global M.
+            m_mask = (m_offs < group_end) & (m_offs < M)
 
             go_tile = tl.load(
                 GO_ptr + n_offs[:, None] * GO_stride_n + m_offs[None, :] * GO_stride_m,
@@ -206,14 +218,15 @@ if _rocm_mxfp8_available:
 
             mb_base = m_base // SCALE_BLOCK
             mb_offs = mb_base + tl.arange(0, SUB_PER_BLOCK_M)
-
+            mb_mask = mb_offs < M_SCALES
+            # other=127 → e8m0 = 2^0 = 1.0; data masked to 0.0 makes tail zero.
             go_scale = tl.load(
                 GO_scales_ptr + n_offs[:, None] * GO_scales_stride_n + mb_offs[None, :] * GO_scales_stride_mb,
-                mask=n_mask[:, None], other=127,
+                mask=n_mask[:, None] & mb_mask[None, :], other=127,
             )
             ia_scale = tl.load(
                 IA_scales_ptr + k_offs[:, None] * IA_scales_stride_k + mb_offs[None, :] * IA_scales_stride_mb,
-                mask=k_mask[:, None], other=127,
+                mask=k_mask[:, None] & mb_mask[None, :], other=127,
             )
 
             acc = tl.dot_scaled(go_tile, go_scale, "e4m3", ia_tile, ia_scale, "e4m3", acc=acc, out_dtype=tl.float32)
@@ -299,10 +312,11 @@ if _rocm_mxfp8_available:
         n_mask = n_offs < N
 
         SUB_PER_BLOCK_K: tl.constexpr = BLOCK_K // SCALE_BLOCK
+        K_SCALES = K // SCALE_BLOCK
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        num_outer = K // BLOCK_K
-        for k_outer in range(0, num_outer):
+        # tl.cdiv covers the K-tail when K is not a multiple of BLOCK_K.
+        for k_outer in range(0, tl.cdiv(K, BLOCK_K)):
             k_offs = k_outer * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = k_offs < K
 
@@ -316,13 +330,16 @@ if _rocm_mxfp8_available:
             )
 
             kb_offs = k_outer * SUB_PER_BLOCK_K + tl.arange(0, SUB_PER_BLOCK_K)
+            kb_mask = kb_offs < K_SCALES
+            # e8m0 bias=127 → 2^0=1.0 (neutral). With data masked to 0.0 the
+            # tail contribution to dot_scaled is 0×1=0 regardless.
             a_scale = tl.load(
                 A_scales_ptr + m_offs[:, None] * A_scales_stride_m + kb_offs[None, :] * A_scales_stride_kb,
-                mask=m_mask[:, None], other=127,
+                mask=m_mask[:, None] & kb_mask[None, :], other=127,
             )
             b_scale = tl.load(
                 B_scales_ptr + n_offs[:, None] * B_scales_stride_n + kb_offs[None, :] * B_scales_stride_kb,
-                mask=n_mask[:, None], other=127,
+                mask=n_mask[:, None] & kb_mask[None, :], other=127,
             )
 
             acc = tl.dot_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", acc=acc, out_dtype=tl.float32)
