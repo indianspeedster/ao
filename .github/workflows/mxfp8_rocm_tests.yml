@@ -26,6 +26,9 @@ jobs:
           . .venv/bin/activate
           python -m pip install --upgrade pip setuptools wheel
           pip install --pre torch pytorch-triton-rocm --index-url $TORCH_INDEX
+          # Upgrade to AMD's triton-rocm (newer than pytorch-triton-rocm
+          # bundled with torch nightly); gives better tl.dot_scaled codegen.
+          pip install --pre --force-reinstall --no-deps triton-rocm --index-url $TORCH_INDEX
           pip install numpy tabulate tqdm pytest expecttest fire
 
       - name: Install torchao (editable)
