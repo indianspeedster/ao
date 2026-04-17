@@ -1195,7 +1195,6 @@ def _compute_wgrad_rocm(
 ) -> torch.Tensor:
     from torchao.prototype.moe_training.kernels.mxfp8.rocm_mxfp8_mm import (
         triton_mxfp8_wgrad,
-        triton_mxfp8_wgrad_split,
     )
     from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim1
 
@@ -1233,17 +1232,8 @@ def _compute_wgrad_rocm(
         input_act.contiguous(), block_size, scale_calculation_mode.value
     )
 
-    # Split-K along M only when a single group leaves too few CTAs to saturate
-    # the device; otherwise the non-split path is faster.
-    E = group_end_offsets.shape[0]
-    if E == 1:
-        grad_weight = triton_mxfp8_wgrad_split(
-            go_data.t(), go_scale, ia_data.t(), ia_scale, group_end_offsets,
-            out_dtype=out_dtype,
-        )
-    else:
-        grad_weight = triton_mxfp8_wgrad(
-            go_data.t(), go_scale, ia_data.t(), ia_scale, group_end_offsets,
-            out_dtype=out_dtype,
-        )
+    grad_weight = triton_mxfp8_wgrad(
+        go_data.t(), go_scale, ia_data.t(), ia_scale, group_end_offsets,
+        out_dtype=out_dtype,
+    )
     return grad_weight.transpose(-2, -1)

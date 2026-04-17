@@ -179,7 +179,7 @@ if _rocm_mxfp8_available:
     # ==================== Weight-gradient grouped GEMM ====================
 
     @triton.jit
-    def _mxfp8_wgrad_kernel(
+    def _mxfp8_wgrad_direct_kernel(
         GO_ptr, GO_stride_n, GO_stride_m,
         GO_scales_ptr, GO_scales_stride_n, GO_scales_stride_mb,
         IA_ptr, IA_stride_k, IA_stride_m,
@@ -217,7 +217,7 @@ if _rocm_mxfp8_available:
         for m_iter in range(0, tl.cdiv(M_g, BLOCK_M)):
             m_base = group_start + m_iter * BLOCK_M
             m_offs = m_base + tl.arange(0, BLOCK_M)
-            m_mask = (m_offs < group_end) & (m_offs < M)
+            m_mask = m_offs < group_end
 
             go_tile = tl.load(
                 GO_ptr + n_offs[:, None] * GO_stride_n + m_offs[None, :] * GO_stride_m,
@@ -253,68 +253,13 @@ if _rocm_mxfp8_available:
             acc.to(tl.bfloat16), mask=c_mask,
         )
 
-    def triton_mxfp8_wgrad(
-        go_t: torch.Tensor,
-        go_scale: torch.Tensor,
-        ia_t: torch.Tensor,
-        ia_scale: torch.Tensor,
-        group_end_offsets: torch.Tensor,
-        out_dtype: torch.dtype = torch.bfloat16,
-        BLOCK_N: int = 256,
-        BLOCK_K: int = 256,
-        BLOCK_M: int = 64,
-        num_warps: int = 8,
-        num_stages: int = 2,
-    ) -> torch.Tensor:
-        """MXFP8 weight gradient: ``grad_W[g] = grad_output[group_g]^T @ input_act[group_g]``.
-
-        Both inputs must be dim1-quantized (scales along the M / token dim).
-
-        Args:
-            go_t: ``(N, M)`` fp8.
-            ia_t: ``(K, M)`` fp8.
-
-        Returns:
-            ``(E, N, K)`` bf16.
-        """
-        N, M = go_t.shape
-        K, _ = ia_t.shape
-        E = group_end_offsets.shape[0]
-        SCALE_BLOCK = 32
-
-        output = torch.empty((E, N, K), dtype=out_dtype, device=go_t.device)
-        grid = (
-            triton.cdiv(N, BLOCK_N),
-            triton.cdiv(K, BLOCK_K),
-            E,
-        )
-
-        _mxfp8_wgrad_kernel[grid](
-            go_t, go_t.stride(0), go_t.stride(1),
-            go_scale.view(torch.uint8),
-            go_scale.stride(0), go_scale.stride(1),
-            ia_t, ia_t.stride(0), ia_t.stride(1),
-            ia_scale.view(torch.uint8),
-            ia_scale.stride(0), ia_scale.stride(1),
-            output, output.stride(0), output.stride(1), output.stride(2),
-            group_end_offsets,
-            M, N, K,
-            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_M=BLOCK_M,
-            SCALE_BLOCK=SCALE_BLOCK,
-            num_warps=num_warps, num_stages=num_stages,
-            matrix_instr_nonkdim=0, kpack=1,
-        )
-        return output
-
-    # ==================== Split-K wgrad ====================
-    #
-    # For large per-group M the wgrad kernel's inner M-loop dominates runtime.
-    # Partition it across SPLIT_M CTAs: each writes a (BN, BK) partial into a
-    # (E, SPLIT_M, N, K) fp32 buffer; a small reduce kernel sums across SPLIT_M
-    # into the (E, N, K) bf16 output.
+    # Partial-sum wgrad: partitions the per-group M-loop across SPLIT_M CTAs
+    # and writes fp32 partials to an (E, SPLIT_M, N, K) buffer; a reduce
+    # kernel sums across SPLIT_M into the (E, N, K) bf16 output. Worth it
+    # when a single group leaves too few CTAs to saturate the device.
 
     @triton.jit
-    def _mxfp8_wgrad_split_kernel(
+    def _mxfp8_wgrad_partial_kernel(
         GO_ptr, GO_stride_n, GO_stride_m,
         GO_scales_ptr, GO_scales_stride_n, GO_scales_stride_mb,
         IA_ptr, IA_stride_k, IA_stride_m,
@@ -356,7 +301,7 @@ if _rocm_mxfp8_available:
         for m_iter in range(pid_split, num_m_iters, SPLIT_M):
             m_base = group_start + m_iter * BLOCK_M
             m_offs = m_base + tl.arange(0, BLOCK_M)
-            m_mask = (m_offs < group_end) & (m_offs < M)
+            m_mask = m_offs < group_end
 
             go_tile = tl.load(
                 GO_ptr + n_offs[:, None] * GO_stride_n + m_offs[None, :] * GO_stride_m,
@@ -424,7 +369,7 @@ if _rocm_mxfp8_available:
             acc.to(tl.bfloat16), mask=c_mask,
         )
 
-    def triton_mxfp8_wgrad_split(
+    def triton_mxfp8_wgrad(
         go_t: torch.Tensor,
         go_scale: torch.Tensor,
         ia_t: torch.Tensor,
@@ -434,32 +379,56 @@ if _rocm_mxfp8_available:
         BLOCK_N: int = 256,
         BLOCK_K: int = 256,
         BLOCK_M: int = 64,
-        SPLIT_M: int = 2,
         num_warps: int = 8,
         num_stages: int = 2,
     ) -> torch.Tensor:
-        """Split-K variant of triton_mxfp8_wgrad.
+        """MXFP8 weight gradient: ``grad_W[g] = grad_output[group_g]^T @ input_act[group_g]``.
 
-        Partitions the per-group M-loop across SPLIT_M CTAs and reduces their
-        partial outputs in a second kernel. Worth it when the per-group
-        inner loop is long enough to dominate serial wgrad throughput.
+        Both inputs must be dim1-quantized (scales along the M / token dim).
+        For a single group (``E == 1``) the (N/BN, K/BK) grid may not saturate
+        the device, so we partition the per-group M-loop across SPLIT_M CTAs
+        and reduce their fp32 partials in a second pass; for E >= 2 the natural
+        grid is enough and we write bf16 directly.
+
+        Args:
+            go_t: ``(N, M)`` fp8.
+            ia_t: ``(K, M)`` fp8.
+
+        Returns:
+            ``(E, N, K)`` bf16.
         """
         N, M = go_t.shape
         K, _ = ia_t.shape
         E = group_end_offsets.shape[0]
         SCALE_BLOCK = 32
+        SPLIT_M = 2 if E == 1 else 1
+
+        output = torch.empty((E, N, K), dtype=out_dtype, device=go_t.device)
+
+        if SPLIT_M == 1:
+            grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K), E)
+            _mxfp8_wgrad_direct_kernel[grid](
+                go_t, go_t.stride(0), go_t.stride(1),
+                go_scale.view(torch.uint8),
+                go_scale.stride(0), go_scale.stride(1),
+                ia_t, ia_t.stride(0), ia_t.stride(1),
+                ia_scale.view(torch.uint8),
+                ia_scale.stride(0), ia_scale.stride(1),
+                output, output.stride(0), output.stride(1), output.stride(2),
+                group_end_offsets,
+                M, N, K,
+                BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_M=BLOCK_M,
+                SCALE_BLOCK=SCALE_BLOCK,
+                num_warps=num_warps, num_stages=num_stages,
+                matrix_instr_nonkdim=0, kpack=1,
+            )
+            return output
 
         partials = torch.empty(
             (E, SPLIT_M, N, K), dtype=torch.float32, device=go_t.device
         )
-        output = torch.empty((E, N, K), dtype=out_dtype, device=go_t.device)
-
-        split_grid = (
-            triton.cdiv(N, BLOCK_N),
-            triton.cdiv(K, BLOCK_K),
-            E * SPLIT_M,
-        )
-        _mxfp8_wgrad_split_kernel[split_grid](
+        partial_grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K), E * SPLIT_M)
+        _mxfp8_wgrad_partial_kernel[partial_grid](
             go_t, go_t.stride(0), go_t.stride(1),
             go_scale.view(torch.uint8),
             go_scale.stride(0), go_scale.stride(1),
@@ -477,11 +446,7 @@ if _rocm_mxfp8_available:
             matrix_instr_nonkdim=0, kpack=1,
         )
 
-        reduce_grid = (
-            triton.cdiv(N, BLOCK_N),
-            triton.cdiv(K, BLOCK_K),
-            E,
-        )
+        reduce_grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K), E)
         _mxfp8_wgrad_reduce_kernel[reduce_grid](
             partials,
             partials.stride(0), partials.stride(1),
@@ -501,7 +466,4 @@ else:
         raise NotImplementedError(_UNAVAILABLE_MSG)
 
     def triton_mxfp8_wgrad(*args, **kwargs):
-        raise NotImplementedError(_UNAVAILABLE_MSG)
-
-    def triton_mxfp8_wgrad_split(*args, **kwargs):
         raise NotImplementedError(_UNAVAILABLE_MSG)
