@@ -44,7 +44,6 @@ from torchao.prototype.moe_training.utils import (
 from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim0
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, to_mx
 from torchao.quantization.quantize_.common import KernelPreference
-from torchao.testing.utils import skip_if_rocm
 
 # Needed since changing args to function causes recompiles
 torch._dynamo.config.cache_size_limit = 1000
@@ -201,7 +200,6 @@ def test_mxfp8_grouped_gemm_2d_3d(M, K, N, num_experts, variant, scale_mode):
     assert sqnr >= min_sqnr, f"sqnr {sqnr} is too low, must be >= {min_sqnr}"
 
 
-@skip_if_rocm("ROCm not supported")
 @pytest.mark.parametrize("M", (1024, 4096))
 @pytest.mark.parametrize("N", (1024, 4096))
 @pytest.mark.parametrize("num_experts", (8, 16))
@@ -249,7 +247,6 @@ def test_emulate_mxfp8_grouped_gemm_2d_2d(M, N, num_experts):
     assert sqnr >= min_sqnr, f"sqnr {sqnr} is too low, must be >= {min_sqnr}"
 
 
-@skip_if_rocm("ROCm not supported")
 @pytest.mark.parametrize("M,K,N", [(32768, 5120, 8192), (16640, 7168, 2048)])
 @pytest.mark.parametrize("num_experts", (1, 8))
 @pytest.mark.parametrize("wgrad_with_hp", (True, False))
@@ -271,7 +268,7 @@ def test_mxfp8_grouped_gemm_with_dq_fwd_bwd(
     scale_mode,
 ):
     # MXFP8 hardware path requires SM100
-    if kernel_preference != KernelPreference.EMULATED and not is_sm_version(10, 0):
+    if kernel_preference != KernelPreference.EMULATED and not (is_sm_version(10, 0) or is_MI350()):
         pytest.skip(
             f"Skipping MXFP8 hardware mode tests, only supported on compute capability 10.0 and found {torch.cuda.get_device_capability()}"
         )
@@ -339,7 +336,6 @@ def test_mxfp8_grouped_gemm_with_dq_fwd_bwd(
     )
 
 
-@skip_if_rocm("ROCm not supported")
 def test_mxfp8_grouped_gemm_from_qdata_and_scales_matches_dynamic():
     block_size = 32
     M, K, N, num_experts = 4096, 1024, 2048, 8
@@ -412,7 +408,6 @@ def test_mxfp8_grouped_gemm_from_qdata_and_scales_matches_dynamic():
     )
 
 
-@skip_if_rocm("ROCm not supported")
 def test_mxfp8_grouped_gemm_from_qdata_and_scales_forward():
     block_size = 32
     M, K, N, num_experts = 4096, 1024, 2048, 8
@@ -466,7 +461,6 @@ def test_mxfp8_grouped_gemm_from_qdata_and_scales_forward():
     )
 
 
-@skip_if_rocm("ROCm not supported")
 def test_mxfp8_grouped_gemm_mxtensor_requires_wgrad_with_hp():
     block_size = 32
     M, K, N, num_experts = 1024, 1024, 2048, 4

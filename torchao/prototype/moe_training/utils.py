@@ -351,6 +351,15 @@ def generate_jagged_offs(E, M, multiple_of=32, dtype=torch.int32, device="cuda")
 
 
 def conditional_nostrict_trace(fn):
+    """
+    Applies @torch._dynamo.nonstrict_trace, except on ROCm where the newer
+    dynamo rejects the FakeTensor output of a custom_op-based kernel (which
+    is what the ROCm MXFP8 path uses) as "not a basic type". The function
+    still runs correctly under torch.compile without the decorator — we
+    just lose the explicit trace hint.
+    """
+    if torch.version.hip is not None:
+        return fn
     return torch._dynamo.nonstrict_trace(fn)
 
 
