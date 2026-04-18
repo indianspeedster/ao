@@ -153,8 +153,7 @@ def print_results(experiments: List[Experiment]):
     rows = []
     for experiment in experiments:
         # calculate tflops
-        e, m, n, k = (
-            experiment.config.e,
+        m, n, k = (
             experiment.config.m,
             experiment.config.n,
             experiment.config.k,

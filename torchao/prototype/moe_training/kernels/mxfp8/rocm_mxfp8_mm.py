@@ -78,7 +78,7 @@ if _rocm_mxfp8_available:
 
                 m_offs = m_base + tl.arange(0, BLOCK_M)
                 n_offs = n_base + tl.arange(0, BLOCK_N)
-                m_mask = (m_offs < group_end) & (m_offs < M)
+                m_mask = m_offs < group_end
                 n_mask = n_offs < N
 
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)

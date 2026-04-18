@@ -42,7 +42,6 @@ from torchao.prototype.moe_training.utils import (
 )
 from torchao.prototype.mx_formats.mx_tensor import MXTensor, to_mx
 from torchao.quantization.quantize_.common import KernelPreference
-from torchao.testing.utils import skip_if_rocm
 
 # Needed since changing args to function causes recompiles
 torch._dynamo.config.cache_size_limit = 1000
