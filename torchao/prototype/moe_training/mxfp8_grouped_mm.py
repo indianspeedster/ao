@@ -1323,13 +1323,17 @@ def _compute_wgrad_rocm(
     )
 
     # Dispatcher: the per-group dense MXFP8 path via hipblaslt beats the Triton
-    # grouped wgrad when either (a) N is large so each GEMM has high arithmetic
-    # intensity, or (b) M is large so per-group Mg is big enough to hide the
-    # launch overhead. The Triton kernel wins on small-M small-N shapes where
-    # the per-group launch overhead would dominate. Wrap the dense-loop path in
-    # a torch.library.custom_op so the Python-level for-loop (data-dependent
-    # .item() branching) is opaque to torch.compile.
-    if grad_output.shape[-1] >= 4096:
+    # grouped wgrad when either (a) N is large (each GEMM has high arithmetic
+    # intensity) or (b) the average per-group reduction dim Mg is large enough
+    # to hide the per-group launch overhead. On small-M small-N shapes the
+    # Triton kernel wins. Wrap the dense-loop path in a torch.library.custom_op
+    # so the Python for-loop (data-dependent .item() branching) stays opaque
+    # to torch.compile.
+    M_total = grad_output.shape[0]
+    G = group_end_offsets.shape[0]
+    Mg_avg = M_total // max(G, 1)
+    use_dense = (grad_output.shape[-1] >= 4096) or (Mg_avg >= 12000)
+    if use_dense:
         grad_weight = _rocm_dense_wgrad(
             go_data.t().contiguous(),
             go_scale,
