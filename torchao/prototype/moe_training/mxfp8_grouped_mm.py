@@ -54,6 +54,96 @@ _SM100_KERNELS_AVAILABLE = (
 _ROCM_MXFP8_KERNELS_AVAILABLE = is_ROCM() and _triton_kernels_available
 
 
+# ScalingType.BlockWise1x32=3, SwizzleType.NO_SWIZZLE=0. Hardcoded to keep the
+# custom op below opaque to torch.compile (dynamo can't introspect those enums).
+_MXFP8_SCALING = [3]
+_MXFP8_SWIZZLE = [0]
+
+
+@torch.library.custom_op("torchao::_rocm_dense_wgrad", mutates_args=())
+def _rocm_dense_wgrad(
+    go_t: torch.Tensor,
+    go_scale: torch.Tensor,
+    ia_t: torch.Tensor,
+    ia_scale: torch.Tensor,
+    group_end_offsets: torch.Tensor,
+    out_dtype: torch.dtype,
+    block_size: int,
+) -> torch.Tensor:
+    """Per-group dense MXFP8 wgrad via ``torch._scaled_mm_v2``.
+
+    Faster than the Triton grouped wgrad on large-N shapes because hipblaslt's
+    block-scaled GEMM is well tuned on gfx950 and the per-group launch overhead
+    is small compared to the kernel time.
+
+    Inputs:
+        go_t:  (N, M) fp8. Row-major contiguous.
+        ia_t:  (K, M) fp8. Row-major contiguous.
+        go_scale: (N, M/block_size) e8m0.
+        ia_scale: (K, M/block_size) e8m0.
+        group_end_offsets: (G,) int32.
+
+    Returns:
+        (G, N, K) of ``out_dtype``.
+    """
+    N, M = go_t.shape
+    K, _ = ia_t.shape
+    G = group_end_offsets.shape[0]
+    grad_weight = torch.empty((G, N, K), dtype=out_dtype, device=go_t.device)
+
+    # hipblaslt needs the reduction dim to be a multiple of 128; offsets are
+    # multiple_of=block_size (32) at the API boundary, so pad each group local.
+    PAD = 128
+    prev = 0
+    for g in range(G):
+        end = int(group_end_offsets[g].item())
+        Mg = end - prev
+        if Mg <= 0:
+            grad_weight[g].zero_()
+            prev = end
+            continue
+        Mg_pad = ((Mg + PAD - 1) // PAD) * PAD
+        if Mg_pad != Mg:
+            A_fp8 = torch.zeros((N, Mg_pad), dtype=go_t.dtype, device=go_t.device)
+            A_fp8[:, :Mg] = go_t[:, prev:end]
+            A_sc = torch.full(
+                (N, Mg_pad // block_size), 127,
+                dtype=go_scale.dtype, device=go_scale.device,
+            )
+            A_sc[:, :Mg // block_size] = go_scale[:, prev // block_size:end // block_size]
+            B_fp8 = torch.zeros((K, Mg_pad), dtype=ia_t.dtype, device=ia_t.device)
+            B_fp8[:, :Mg] = ia_t[:, prev:end]
+            B_sc = torch.full(
+                (K, Mg_pad // block_size), 127,
+                dtype=ia_scale.dtype, device=ia_scale.device,
+            )
+            B_sc[:, :Mg // block_size] = ia_scale[:, prev // block_size:end // block_size]
+        else:
+            A_fp8 = go_t[:, prev:end].contiguous()
+            A_sc = go_scale[:, prev // block_size:end // block_size].contiguous()
+            B_fp8 = ia_t[:, prev:end].contiguous()
+            B_sc = ia_scale[:, prev // block_size:end // block_size].contiguous()
+        torch._scaled_mm_v2(
+            A_fp8, B_fp8.t(),
+            [A_sc], _MXFP8_SCALING, _MXFP8_SWIZZLE,
+            [B_sc], _MXFP8_SCALING, _MXFP8_SWIZZLE,
+            None, out_dtype,
+            out=grad_weight[g],
+        )
+        prev = end
+    return grad_weight
+
+
+@_rocm_dense_wgrad.register_fake
+def _rocm_dense_wgrad_fake(
+    go_t, go_scale, ia_t, ia_scale, group_end_offsets, out_dtype, block_size,
+):
+    N = go_t.shape[0]
+    K = ia_t.shape[0]
+    G = group_end_offsets.shape[0]
+    return torch.empty((G, N, K), dtype=out_dtype, device=go_t.device)
+
+
 def _validate_grouped_mm_input_act(
     input_act: torch.Tensor,
     block_size: int,
@@ -1231,6 +1321,22 @@ def _compute_wgrad_rocm(
     ia_data, ia_scale = triton_to_mxfp8_dim1(
         input_act.contiguous(), block_size, scale_calculation_mode.value
     )
+
+    # Dispatcher: on large-N the per-group dense MXFP8 path via hipblaslt beats
+    # Triton wgrad by 15-25%; on small N, per-group launch overhead wins. Wrap
+    # the dense-loop path in a custom op so the Python-level for-loop (with
+    # data-dependent .item() branching) is opaque to torch.compile.
+    if grad_output.shape[-1] >= 4096:
+        grad_weight = _rocm_dense_wgrad(
+            go_data.t().contiguous(),
+            go_scale,
+            ia_data.t().contiguous(),
+            ia_scale,
+            group_end_offsets,
+            out_dtype,
+            block_size,
+        )
+        return grad_weight.transpose(-2, -1)
 
     grad_weight = triton_mxfp8_wgrad(
         go_data.t(), go_scale, ia_data.t(), ia_scale, group_end_offsets,
