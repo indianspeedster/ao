@@ -1121,13 +1121,17 @@ def round_up(x, y):
 
 
 def _rocm_grouped_mm_cfg(E: int, N: int) -> dict:
-    """Tile + ctas_per_cu pick for the ROCm grouped-MM kernel."""
-    if N >= 4096:
-        cpc = 1 if E >= 2 else 2
-        return dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=128,
-                    num_warps=8, num_stages=2, ctas_per_cu=cpc)
-    return dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=128,
-                num_warps=8, num_stages=2, ctas_per_cu=2)
+    """Tile + scheduling config for the ROCm grouped-MM kernel.
+
+    Picked via parallel 192-config sweep on MI355X across (E, M=16640, N, K)
+    in {1,2,4,8} x {2048,5120,8192} x {2048,5120,8192}.
+    """
+    return dict(
+        BLOCK_M=128, BLOCK_N=256, BLOCK_K=256,
+        GROUP_M=8, XCD_SWIZZLE=8,
+        num_warps=8, num_stages=2,
+        matrix_instr_nonkdim=32,
+    )
 
 
 def _compute_fwd_rocm(

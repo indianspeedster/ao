@@ -27,106 +27,271 @@ if _rocm_mxfp8_available:
 
     # ==================== Grouped GEMM (fwd / dgrad) ====================
     #
-    # Persistent kernel: grid = num_CUs * ctas_per_cu. Each CTA walks the
-    # expert list with a global tile counter and picks every num_ctas-th
-    # (group, m_tile, n_tile) triple. This avoids a data-dependent grid and
-    # silent row-dropping when any group exceeds an M-per-expert bound, so
-    # the Python dispatcher needs no sync on offsets and stays
-    # torch.compile-clean.
+    # Non-persistent MoE GEMM adapted from AMD's aiter
+    # (aiter/ops/triton/_triton_kernels/moe/moe_op_gemm_a8w8.py), which in
+    # turn derives from triton-lang's triton_kernels matmul_ogs.
+    #
+    # Scheduling uses:
+    #   - XCD swizzle (ordered per-XCD launch for MI300/MI350 8-XCD parts),
+    #   - Group_M pid reordering for L2 reuse,
+    #   - Per-tile expert lookup via a packed (block_id << 16) | expt_id map.
+    #
+    # Requires:
+    #   - ``weight`` column-major on the last two dims (``w.stride(-2) == 1``).
+    #   - Scales are e8m0 viewed as uint8 with shape matching the data.
+    #
+    # The swiglu / bias / static-scale / gather-scatter plumbing from aiter is
+    # dropped here; torchao's dispatcher handles those concerns upstream.
+
+    @triton.jit
+    def _xcd_swizzle(pid, domain_size, XCD_SWIZZLE: tl.constexpr):
+        pids_per_group = domain_size // XCD_SWIZZLE
+        extra_pid_groups = domain_size % XCD_SWIZZLE
+        group = pid % XCD_SWIZZLE
+        local_pid = pid // XCD_SWIZZLE
+        return group * pids_per_group + min(group, extra_pid_groups) + local_pid
+
+    @triton.jit
+    def _pid_grid(pid, num_pid_m, num_pid_n, GROUP_M: tl.constexpr = 1):
+        if GROUP_M == 1:
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
+        else:
+            num_pid_in_group = GROUP_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+            tl.assume(group_size_m >= 0)
+            pid_m = first_pid_m + (pid % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
+        return pid_m, pid_n
+
+    @triton.jit
+    def _unswizzle_mx_scale_cdna4(
+        x,
+        BLOCK_N: tl.constexpr,
+        MX_SCALE_BLOCK_K: tl.constexpr,
+        N_PRESHUFFLE_FACTOR: tl.constexpr = 32,
+    ):
+        x = x.reshape(
+            BLOCK_N // N_PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K // 8, 4, 16, 2, 2, 1
+        )
+        x = x.permute(0, 5, 3, 1, 4, 2, 6)
+        return x.reshape(BLOCK_N, MX_SCALE_BLOCK_K)
 
     @triton.jit
     def _mxfp8_grouped_mm_kernel(
-        A_ptr, A_stride_m, A_stride_k,
-        B_ptr, B_stride_e, B_stride_n, B_stride_k,
-        A_scales_ptr, A_scales_stride_m, A_scales_stride_kb,
-        B_scales_ptr, B_scales_stride_e, B_scales_stride_n, B_scales_stride_kb,
-        C_ptr, C_stride_m, C_stride_n,
-        group_end_offsets_ptr,
-        M, N, K,
-        E: tl.constexpr,
+        Y, stride_y_m, stride_y_n,
+        X, stride_x_m, stride_x_k,
+        XMxScale, stride_x_mx_m, stride_x_mx_k,
+        W, stride_w_e, stride_w_k, stride_w_n,
+        WMxScale, stride_w_mx_e, stride_w_mx_k, stride_w_mx_n,
+        N, K,
+        ExptHist,       # (E,) int32 — tokens per expert
+        ExptOffs,       # (E,) int32 — start offset per expert (expert-sorted)
+        ExptOffsSum,    # 0-d int32 — total tile blocks (sum of cdiv(hist[e], BLOCK_M))
+        ExptData,       # (grid_m_max,) int32 — packed (block_id<<16)|expt_id, -1 pad
+        grid_m, grid_n,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
-        SCALE_BLOCK: tl.constexpr,
+        GROUP_M: tl.constexpr,
+        XCD_SWIZZLE: tl.constexpr,
+        # "CDNA4_SCALE" enables pre-shuffled MX scale layout; None = plain.
+        SWIZZLE_MX_SCALE: tl.constexpr,
+        EVEN_K: tl.constexpr,
+        MASK_K_LIMIT: tl.constexpr,
+        W_CACHE_MODIFIER: tl.constexpr,
+        UPCAST_INDICES: tl.constexpr = False,
     ):
+        MX_PACK_DIVISOR: tl.constexpr = 32
+
         pid = tl.program_id(0)
-        num_ctas = tl.num_programs(0)
+        if ExptOffsSum is not None and XCD_SWIZZLE > 1:
+            padding_m = grid_m - tl.load(ExptOffsSum)
+        else:
+            padding_m: tl.constexpr = 0
 
-        num_n = tl.cdiv(N, BLOCK_N)
-        SUB_PER_BLOCK_K: tl.constexpr = BLOCK_K // SCALE_BLOCK
-        K_SCALES = K // SCALE_BLOCK
+        index_type: tl.constexpr = tl.int64 if UPCAST_INDICES else tl.int32
+        unpadded_m = grid_m - padding_m
+        tl.assume(unpadded_m >= 0)
+        total_actual_tiles = unpadded_m * grid_n
+        if padding_m > 0 and pid >= total_actual_tiles:
+            return
 
-        my_next = pid  # this CTA's next global tile index
-        cum = 0        # total tiles across groups [0, g)
+        pid_emn = pid
+        if XCD_SWIZZLE != 1:
+            pid_emn = _xcd_swizzle(pid_emn, total_actual_tiles, XCD_SWIZZLE)
+        pid_m, pid_n = _pid_grid(pid_emn, unpadded_m, grid_n, GROUP_M)
 
-        for g in range(E):
-            group_start = tl.load(
-                group_end_offsets_ptr + g - 1, mask=g > 0, other=0
-            )
-            group_end = tl.load(group_end_offsets_ptr + g)
-            group_size = group_end - group_start
-            num_m = tl.cdiv(group_size, BLOCK_M)
-            tiles_in_group = num_m * num_n
+        expt_data = tl.load(ExptData + pid_m)
+        if expt_data == -1:
+            return
+        expt_id = expt_data & 0x0000FFFF
+        block_id = expt_data >> 16
+        M = tl.load(ExptHist + expt_id)
+        start_m = tl.load(ExptOffs + expt_id)
+        expt_id = expt_id.to(index_type)
+        block_id = block_id.to(index_type)
+        start_m = start_m.to(index_type)
+        pid_n = pid_n.to(index_type)
 
-            while my_next < cum + tiles_in_group:
-                local = my_next - cum
-                mt = local // num_n
-                nt = local % num_n
+        # X pointers (A, per-expert slice)
+        offs_x_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
+        offs_x_m = tl.max_contiguous(tl.multiple_of(offs_x_m % M, BLOCK_M), BLOCK_M)
+        X += start_m * stride_x_m
+        offs_x_k = tl.arange(0, BLOCK_K)
+        XPtrs = (
+            X
+            + offs_x_m.to(index_type)[:, None] * stride_x_m
+            + offs_x_k.to(index_type)[None, :] * stride_x_k
+        )
 
-                m_base = group_start + mt * BLOCK_M
-                n_base = nt * BLOCK_N
+        MX_SCALE_BLOCK_K: tl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
-                m_offs = m_base + tl.arange(0, BLOCK_M)
-                n_offs = n_base + tl.arange(0, BLOCK_N)
-                m_mask = (m_offs < group_end) & (m_offs < M)
-                n_mask = n_offs < N
+        # W scale pointers
+        WMxScale += expt_id * stride_w_mx_e
+        if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+            NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
+            PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
+            SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
+        else:
+            PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
+            SCALE_BLOCK_N: tl.constexpr = BLOCK_N
+        offs_w_n_scale = (pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)) % N
+        offs_w_n_scale = tl.max_contiguous(
+            tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
+        )
+        offs_w_k_scale = tl.arange(0, PACKED_MX_BLOCK)
+        WMxScalePtrs = (
+            WMxScale
+            + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
+            + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
+        )
 
-                acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-                for k_outer in range(0, tl.cdiv(K, BLOCK_K)):
-                    k_offs = k_outer * BLOCK_K + tl.arange(0, BLOCK_K)
-                    k_mask = k_offs < K
-                    a = tl.load(
-                        A_ptr + m_offs[:, None] * A_stride_m
-                              + k_offs[None, :] * A_stride_k,
-                        mask=m_mask[:, None] & k_mask[None, :], other=0.0,
-                    )
-                    b = tl.load(
-                        B_ptr + g * B_stride_e
-                              + n_offs[None, :] * B_stride_n
-                              + k_offs[:, None] * B_stride_k,
-                        mask=k_mask[:, None] & n_mask[None, :], other=0.0,
-                    )
-                    kb_offs = k_outer * SUB_PER_BLOCK_K + tl.arange(0, SUB_PER_BLOCK_K)
-                    kb_mask = kb_offs < K_SCALES
-                    # other=127: e8m0 bias 127 = 2^0 = 1.0 (neutral); combined
-                    # with data masked to 0.0 the tail contribution is 0.
-                    a_scale = tl.load(
-                        A_scales_ptr + m_offs[:, None] * A_scales_stride_m
-                                     + kb_offs[None, :] * A_scales_stride_kb,
-                        mask=m_mask[:, None] & kb_mask[None, :], other=127,
-                    )
-                    b_scale = tl.load(
-                        B_scales_ptr + g * B_scales_stride_e
-                                     + n_offs[:, None] * B_scales_stride_n
-                                     + kb_offs[None, :] * B_scales_stride_kb,
-                        mask=n_mask[:, None] & kb_mask[None, :], other=127,
-                    )
-                    acc = tl.dot_scaled(
-                        a, a_scale, "e4m3",
-                        b, b_scale, "e4m3",
-                        acc=acc, out_dtype=tl.float32,
-                    )
+        # W pointers
+        offs_w_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_w_n = tl.max_contiguous(tl.multiple_of(offs_w_n % N, BLOCK_N), BLOCK_N)
+        offs_w_k = tl.arange(0, BLOCK_K)
+        W += expt_id * stride_w_e
+        WPtrs = W + (
+            offs_w_k.to(index_type)[:, None] * stride_w_k
+            + offs_w_n.to(index_type)[None, :] * stride_w_n
+        )
 
-                c_mask = m_mask[:, None] & n_mask[None, :]
-                tl.store(
-                    C_ptr + m_offs[:, None] * C_stride_m
-                          + n_offs[None, :] * C_stride_n,
-                    acc.to(tl.bfloat16), mask=c_mask,
+        # X scale pointers
+        XMxScale += start_m * stride_x_mx_m
+        offs_x_k_scale = tl.arange(0, MX_SCALE_BLOCK_K)
+        XMxScalePtrs = (
+            XMxScale
+            + offs_x_m.to(index_type)[:, None] * stride_x_mx_m
+            + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
+        )
+
+        num_k_iter = tl.cdiv(K, BLOCK_K)
+        if not EVEN_K:
+            num_k_iter -= 1
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for _ in range(num_k_iter):
+            x = tl.load(XPtrs)
+            w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
+            x_scales = tl.load(XMxScalePtrs)
+            if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+                w_scales = _unswizzle_mx_scale_cdna4(
+                    tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                    BLOCK_N, MX_SCALE_BLOCK_K,
                 )
+            else:
+                w_scales = tl.load(WMxScalePtrs)
 
-                my_next += num_ctas
+            acc = tl.dot_scaled(
+                x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
+            )
 
-            cum += tiles_in_group
+            WMxScalePtrs += PACKED_MX_BLOCK * stride_w_mx_k
+            XMxScalePtrs += MX_SCALE_BLOCK_K * stride_x_mx_k
+            XPtrs += BLOCK_K * stride_x_k
+            WPtrs += BLOCK_K * stride_w_k
+
+        if not EVEN_K:
+            mask_x_k = offs_x_k < MASK_K_LIMIT
+            mask_w_k = offs_w_k < MASK_K_LIMIT
+            if SWIZZLE_MX_SCALE is None:
+                mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
+            mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
+
+            x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
+            w = tl.load(WPtrs, mask=mask_w_k[:, None], other=0.0,
+                        cache_modifier=W_CACHE_MODIFIER)
+            x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
+            if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+                w_scales = _unswizzle_mx_scale_cdna4(
+                    tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                    BLOCK_N, MX_SCALE_BLOCK_K,
+                )
+            else:
+                w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
+
+            acc = tl.dot_scaled(
+                x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
+            )
+
+        # Write-back
+        offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
+        offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)
+        mask_m = offs_m < M
+        mask_n = offs_y_n < N
+        Y += start_m * stride_y_m
+        YPtrs = (
+            Y
+            + offs_m.to(index_type)[:, None] * stride_y_m
+            + offs_y_n.to(index_type)[None, :] * stride_y_n
+        )
+        tl.store(YPtrs, acc.to(Y.dtype.element_ty),
+                 mask=mask_m[:, None] & mask_n[None, :])
+
+    def _build_expt_data(
+        group_end_offsets: torch.Tensor, M: int, E: int, block_m: int
+    ):
+        """Build (hist, offs_raw, offs_pad_sum, block_pid_map, grid_m_ub) from
+        group offsets without any d2h sync. Computed entirely on the device so
+        we stay torch.compile-clean.
+
+        block_pid_map is over-allocated to an upper bound ``cdiv(M, block_m) + E``;
+        tail positions are ``-1`` and the kernel early-exits on them.
+        ``grid_m_ub`` is a Python int (derived from M and E, both host-known).
+        """
+        device = group_end_offsets.device
+        zero = torch.zeros(1, dtype=torch.int32, device=device)
+        offs_i32 = group_end_offsets.to(torch.int32)
+        offs_with_zero = torch.cat([zero, offs_i32])
+        hist = offs_with_zero[1:] - offs_with_zero[:-1]              # (E,) int32
+        offs_raw = offs_with_zero[:E].contiguous()                   # (E,) int32
+
+        blocks_per_expert = (hist + block_m - 1) // block_m          # (E,) int32
+        cum_blocks = torch.cat([
+            zero, blocks_per_expert.cumsum(0).to(torch.int32)
+        ])                                                           # (E+1,) int32
+        offs_pad_sum = cum_blocks[-1]                                # 0-d int32
+
+        # Safe upper bound for grid_m: a group may contribute at most
+        # cdiv(group_size, block_m) tiles, and sum_g group_size == M.
+        # Each group rounds up by at most (block_m-1)/block_m of a tile, so
+        # total blocks <= cdiv(M, block_m) + E - 1.
+        import triton
+        grid_m_ub = triton.cdiv(M, block_m) + max(E - 1, 0)
+
+        pids = torch.arange(grid_m_ub, dtype=torch.int32, device=device)
+        # For each pid, find expert e such that cum_blocks[e] <= pid < cum_blocks[e+1].
+        # right=True makes searchsorted treat equal values as "strictly greater"
+        # for the upper bound, so subtracting 1 gives the owning expert.
+        e_idx = (torch.searchsorted(cum_blocks, pids, right=True) - 1).clamp(min=0, max=E - 1)
+        block_in_e = pids - cum_blocks[e_idx]
+        value = (block_in_e.to(torch.int32) << 16) | e_idx.to(torch.int32)
+        invalid = pids >= offs_pad_sum
+        block_pid_map = torch.where(invalid, torch.full_like(value, -1), value)
+        return hist, offs_raw, offs_pad_sum, block_pid_map, grid_m_ub
 
     def triton_mxfp8_grouped_mm(
         input_act: torch.Tensor,
@@ -136,43 +301,60 @@ if _rocm_mxfp8_available:
         group_end_offsets: torch.Tensor,
         out_dtype: torch.dtype = torch.bfloat16,
         BLOCK_M: int = 128,
-        BLOCK_N: int = 128,
-        BLOCK_K: int = 128,
+        BLOCK_N: int = 256,
+        BLOCK_K: int = 256,
+        GROUP_M: int = 8,
+        XCD_SWIZZLE: int = 8,
         num_warps: int = 8,
         num_stages: int = 2,
-        ctas_per_cu: int = 2,
+        matrix_instr_nonkdim: int = 32,
     ) -> torch.Tensor:
         """MXFP8 grouped GEMM: ``output[g] = input_act[group_g] @ weight[g]^T``.
 
         Args:
-            input_act: ``(M, K)`` fp8.
-            weight: ``(E, N, K)`` fp8.
-            ctas_per_cu: number of persistent CTAs per compute unit; grid is
-                ``num_cus * ctas_per_cu``.
+            input_act: ``(M, K)`` fp8, row-major.
+            weight: ``(E, N, K)`` fp8 row-major; internally viewed as column-major
+                (``E, K, N``) before launch (``stride(-2)`` must become 1).
+            input_act_scales: ``(M, K//32)`` e8m0-viewed-as-uint8.
+            weight_scales: ``(E, N, K//32)`` e8m0-viewed-as-uint8.
+            group_end_offsets: ``(E,)`` int32, cumulative token counts per expert.
         """
         M, K = input_act.shape
-        E, N, _ = weight.shape
-        SCALE_BLOCK = 32
+        E, N, K2 = weight.shape
+        assert K == K2, f"K mismatch: A={K}, B={K2}"
+
+        # Column-major view of W: (E, N, K) row-major -> (E, K, N) with stride(-2)==1.
+        # kernel expects W shape (E, K, N) and its W_scales shape (E, K//32, N).
+        w_kn = weight.permute(0, 2, 1)
+        w_scales_kn = weight_scales.view(torch.uint8).permute(0, 2, 1)
+        x_scales_u8 = input_act_scales.view(torch.uint8)
+
+        hist, offs_raw, offs_pad_sum, block_pid_map, grid_m = _build_expt_data(
+            group_end_offsets, M, E, BLOCK_M
+        )
+        grid_n = triton.cdiv(N, BLOCK_N)
+        grid = (grid_m * grid_n,)
 
         output = torch.empty((M, N), dtype=out_dtype, device=input_act.device)
-        num_cus = torch.cuda.get_device_properties(input_act.device).multi_processor_count
-        grid = (num_cus * ctas_per_cu,)
 
         _mxfp8_grouped_mm_kernel[grid](
-            input_act, input_act.stride(0), input_act.stride(1),
-            weight, weight.stride(0), weight.stride(1), weight.stride(2),
-            input_act_scales.view(torch.uint8),
-            input_act_scales.stride(0), input_act_scales.stride(1),
-            weight_scales.view(torch.uint8),
-            weight_scales.stride(0), weight_scales.stride(1), weight_scales.stride(2),
             output, output.stride(0), output.stride(1),
-            group_end_offsets,
-            M, N, K,
-            E=E,
+            input_act, input_act.stride(0), input_act.stride(1),
+            x_scales_u8, x_scales_u8.stride(0), x_scales_u8.stride(1),
+            w_kn, w_kn.stride(0), w_kn.stride(1), w_kn.stride(2),
+            w_scales_kn, w_scales_kn.stride(0), w_scales_kn.stride(1), w_scales_kn.stride(2),
+            N, K,
+            hist, offs_raw, offs_pad_sum, block_pid_map,
+            grid_m, grid_n,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            SCALE_BLOCK=SCALE_BLOCK,
+            GROUP_M=GROUP_M, XCD_SWIZZLE=XCD_SWIZZLE,
+            SWIZZLE_MX_SCALE=None,
+            EVEN_K=(K % BLOCK_K == 0), MASK_K_LIMIT=(K % BLOCK_K),
+            W_CACHE_MODIFIER=None,
+            UPCAST_INDICES=False,
             num_warps=num_warps, num_stages=num_stages,
-            matrix_instr_nonkdim=0, kpack=1,
+            matrix_instr_nonkdim=matrix_instr_nonkdim, kpack=1,
+            waves_per_eu=0,
         )
         return output
 
