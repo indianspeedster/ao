@@ -155,9 +155,11 @@ if _rocm_mxfp8_available:
             NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
             PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
             SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
+            SCALE_BLOCK_M: tl.constexpr = BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE
         else:
             PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
             SCALE_BLOCK_N: tl.constexpr = BLOCK_N
+            SCALE_BLOCK_M: tl.constexpr = BLOCK_M
         offs_w_n_scale = (pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)) % N
         offs_w_n_scale = tl.max_contiguous(
             tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
@@ -180,11 +182,25 @@ if _rocm_mxfp8_available:
         )
 
         # X scale pointers
-        XMxScale += start_m * stride_x_mx_m
-        offs_x_k_scale = tl.arange(0, MX_SCALE_BLOCK_K)
+        # Plain path: tile shape (BLOCK_M, MX_SCALE_BLOCK_K), stride_x_mx_m
+        #   indexes the M-dim of the original (total_M, K//32) scale tensor.
+        # CDNA4_SCALE path: scales are pre-shuffled to (total_M//32, K) and
+        #   stride_x_mx_m indexes the M//32-dim. We load a (SCALE_BLOCK_M,
+        #   PACKED_MX_BLOCK) = (BLOCK_M/32, BLOCK_K) tile and unshuffle it
+        #   back to (BLOCK_M, MX_SCALE_BLOCK_K) before tl.dot_scaled.
+        if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+            # start_m is guaranteed to be a multiple of 32 (groups are
+            # padded to the MX block_size). Advance to the expert slice.
+            XMxScale += (start_m // 32) * stride_x_mx_m
+            offs_x_m_scale = BLOCK_M // NON_K_PRESHUFFLE_BLOCK_SIZE * block_id + tl.arange(0, SCALE_BLOCK_M)
+            offs_x_k_scale = tl.arange(0, PACKED_MX_BLOCK)
+        else:
+            XMxScale += start_m * stride_x_mx_m
+            offs_x_m_scale = offs_x_m
+            offs_x_k_scale = tl.arange(0, MX_SCALE_BLOCK_K)
         XMxScalePtrs = (
             XMxScale
-            + offs_x_m.to(index_type)[:, None] * stride_x_mx_m
+            + offs_x_m_scale.to(index_type)[:, None] * stride_x_mx_m
             + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
         )
 
@@ -196,13 +212,16 @@ if _rocm_mxfp8_available:
         for _ in range(num_k_iter):
             x = tl.load(XPtrs)
             w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
-            x_scales = tl.load(XMxScalePtrs)
             if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+                x_scales = _unswizzle_mx_scale_cdna4(
+                    tl.load(XMxScalePtrs), BLOCK_M, MX_SCALE_BLOCK_K,
+                )
                 w_scales = _unswizzle_mx_scale_cdna4(
                     tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
                     BLOCK_N, MX_SCALE_BLOCK_K,
                 )
             else:
+                x_scales = tl.load(XMxScalePtrs)
                 w_scales = tl.load(WMxScalePtrs)
 
             acc = tl.dot_scaled(
@@ -210,7 +229,7 @@ if _rocm_mxfp8_available:
             )
 
             WMxScalePtrs += PACKED_MX_BLOCK * stride_w_mx_k
-            XMxScalePtrs += MX_SCALE_BLOCK_K * stride_x_mx_k
+            XMxScalePtrs += PACKED_MX_BLOCK * stride_x_mx_k
             XPtrs += BLOCK_K * stride_x_k
             WPtrs += BLOCK_K * stride_w_k
 
@@ -219,18 +238,21 @@ if _rocm_mxfp8_available:
             mask_w_k = offs_w_k < MASK_K_LIMIT
             if SWIZZLE_MX_SCALE is None:
                 mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
-            mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
+                mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
 
             x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
             w = tl.load(WPtrs, mask=mask_w_k[:, None], other=0.0,
                         cache_modifier=W_CACHE_MODIFIER)
-            x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
             if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+                x_scales = _unswizzle_mx_scale_cdna4(
+                    tl.load(XMxScalePtrs), BLOCK_M, MX_SCALE_BLOCK_K,
+                )
                 w_scales = _unswizzle_mx_scale_cdna4(
                     tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
                     BLOCK_N, MX_SCALE_BLOCK_K,
                 )
             else:
+                x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
                 w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
 
             acc = tl.dot_scaled(
@@ -353,6 +375,19 @@ if _rocm_mxfp8_available:
         x = x.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
         return x.reshape(E, N // 32, Ks * 32)
 
+    def _shuffle_x_scales_cdna4_nonkdim16(x_scales: torch.Tensor) -> torch.Tensor:
+        """Pre-shuffle (M, K//32) uint8 X (activation) scales into CDNA4
+        nonkdim=16 layout. Output (M//32, K). Symmetric to the W-scale
+        shuffle; same ``_unswizzle_mx_scale_cdna4`` helper consumes it.
+
+        Requires M % 32 == 0 and K % 256 == 0. For grouped MM, group
+        start offsets must also be multiples of 32 (standard MX padding).
+        """
+        M, Ks = x_scales.shape
+        x = x_scales.reshape(M // 32, 2, 16, Ks // 8, 2, 4, 1)
+        x = x.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+        return x.reshape(M // 32, Ks * 32)
+
     def _pick_block_nk(N: int, K: int) -> tuple:
         """Shape-aware (BLOCK_N, BLOCK_K) pick, derived from an 864-run
         per-shape sweep on gfx950/MI355X across (E, M=16640, N, K) with
@@ -420,8 +455,13 @@ if _rocm_mxfp8_available:
         #     per-tile BLOCK_K is at least 256 on the enabled path)
         # The nonkdim=16 unshuffle in `_unswizzle_mx_scale_cdna4` pairs with
         # matrix_instr_nonkdim=16 (vs our plain path's 32).
-        use_cdna4_w_scale = (
-            BLOCK_K >= 256 and K % 256 == 0 and N % 32 == 0
+        # CDNA4_SCALE path enables pre-shuffled scales for BOTH X and W so
+        # the MFMA scale load is a single coalesced block per thread (no
+        # #blocked->#linear1 permute chain). Requires:
+        #   * BLOCK_K >= 256 (tutorial formula needs K_scale//8 >= 1)
+        #   * N, M % 32 == 0 (scale preshuffle factor)
+        use_cdna4_scale = (
+            BLOCK_K >= 256 and K % 256 == 0 and N % 32 == 0 and M % 32 == 0
         )
 
         # Column-major view of W (E, K, N) with stride(-2)==1, required by
@@ -430,24 +470,37 @@ if _rocm_mxfp8_available:
         x_scales_u8 = input_act_scales.view(torch.uint8)
         w_scales_u8 = weight_scales.view(torch.uint8)
 
-        if use_cdna4_w_scale:
+        if use_cdna4_scale:
             w_scales_shuf = _shuffle_w_scales_cdna4_nonkdim16(w_scales_u8)
             # (E, N//32, K) layout. Kernel expects stride_w_mx_n along the
             # N//32-sized dim and stride_w_mx_k along the K-sized dim.
+            w_scales_arg = w_scales_shuf
             w_scales_stride_e = w_scales_shuf.stride(0)
             w_scales_stride_n = w_scales_shuf.stride(1)
             w_scales_stride_k = w_scales_shuf.stride(2)
-            w_scales_arg = w_scales_shuf
+
+            x_scales_shuf = _shuffle_x_scales_cdna4_nonkdim16(x_scales_u8)
+            # (M//32, K) layout. stride(0) is along the M//32-dim (which
+            # the kernel advances per-expert via start_m//32), stride(1)
+            # is the K-dim step.
+            x_scales_arg = x_scales_shuf
+            x_scales_stride_m = x_scales_shuf.stride(0)
+            x_scales_stride_k = x_scales_shuf.stride(1)
+
             swizzle_mx_scale = "CDNA4_SCALE"
             nonkdim = 16
         else:
-            # Plain path: (E, K//32, N) column-major so the kernel's coalesced
-            # N-inner load works, matching stride_w_mx_n=1, stride_w_mx_k=N.
+            # Plain path: W (E, K//32, N), X (M, K//32).
             w_scales_kn = w_scales_u8.permute(0, 2, 1)
+            w_scales_arg = w_scales_kn
             w_scales_stride_e = w_scales_kn.stride(0)
             w_scales_stride_k = w_scales_kn.stride(1)
             w_scales_stride_n = w_scales_kn.stride(2)
-            w_scales_arg = w_scales_kn
+
+            x_scales_arg = x_scales_u8
+            x_scales_stride_m = x_scales_u8.stride(0)
+            x_scales_stride_k = x_scales_u8.stride(1)
+
             swizzle_mx_scale = None
             nonkdim = matrix_instr_nonkdim
 
@@ -462,7 +515,7 @@ if _rocm_mxfp8_available:
         _mxfp8_grouped_mm_kernel[grid](
             output, output.stride(0), output.stride(1),
             input_act, input_act.stride(0), input_act.stride(1),
-            x_scales_u8, x_scales_u8.stride(0), x_scales_u8.stride(1),
+            x_scales_arg, x_scales_stride_m, x_scales_stride_k,
             w_kn, w_kn.stride(0), w_kn.stride(1), w_kn.stride(2),
             w_scales_arg, w_scales_stride_e, w_scales_stride_k, w_scales_stride_n,
             N, K,
