@@ -337,6 +337,22 @@ if _rocm_mxfp8_available:
         )
         return hist, offs_raw, offs_pad_sum, block_pid_map, grid_m_ub
 
+    def _shuffle_w_scales_cdna4_nonkdim16(w_scales: torch.Tensor) -> torch.Tensor:
+        """Pre-shuffle (E, N, K//32) uint8 W scales into the CDNA4 nonkdim=16
+        native layout, so the MM kernel's `_unswizzle_mx_scale_cdna4` + native
+        LDS lanes match #linear1 with zero permutes.
+
+        Output: (E, N//32, K), same total bytes, contiguous. Matches the
+        inverse of ``_unswizzle_mx_scale_cdna4(BLOCK_N=?, MX_SCALE_BLOCK_K=?)``.
+
+        Requires N % 32 == 0 and K//32 % 8 == 0 (i.e. K % 256 == 0).
+        """
+        E, N, Ks = w_scales.shape
+        # Apply the tutorial-10 nonkdim=16 shuffle to each expert, batched.
+        x = w_scales.reshape(E, N // 32, 2, 16, Ks // 8, 2, 4, 1)
+        x = x.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
+        return x.reshape(E, N // 32, Ks * 32)
+
     def _pick_block_nk(N: int, K: int) -> tuple:
         """Shape-aware (BLOCK_N, BLOCK_K) pick, derived from an 864-run
         per-shape sweep on gfx950/MI355X across (E, M=16640, N, K) with
@@ -393,11 +409,47 @@ if _rocm_mxfp8_available:
             if BLOCK_K is None:
                 BLOCK_K = _bk
 
-        # Column-major view of W: (E, N, K) row-major -> (E, K, N) with stride(-2)==1.
-        # kernel expects W shape (E, K, N) and its W_scales shape (E, K//32, N).
+        # CDNA4_SCALE path: pre-shuffle W scales into the layout that
+        # v_mfma_scale_f32_16x16x128_f8f6f4 consumes natively, so the kernel
+        # loads one coalesced block per thread instead of the 6x ds_read_u8 +
+        # 3x v_perm_b32 chain the #blocked->#linear1 lowering produces.
+        #
+        # Requires:
+        #   * N % 32 == 0 (scale preshuffle factor)
+        #   * K % 256 == 0 (tutorial formula needs K_scale//8 >= 1, and our
+        #     per-tile BLOCK_K is at least 256 on the enabled path)
+        # The nonkdim=16 unshuffle in `_unswizzle_mx_scale_cdna4` pairs with
+        # matrix_instr_nonkdim=16 (vs our plain path's 32).
+        use_cdna4_w_scale = (
+            BLOCK_K >= 256 and K % 256 == 0 and N % 32 == 0
+        )
+
+        # Column-major view of W (E, K, N) with stride(-2)==1, required by
+        # the MM kernel (weight data layout is independent of scale layout).
         w_kn = weight.permute(0, 2, 1)
-        w_scales_kn = weight_scales.view(torch.uint8).permute(0, 2, 1)
         x_scales_u8 = input_act_scales.view(torch.uint8)
+        w_scales_u8 = weight_scales.view(torch.uint8)
+
+        if use_cdna4_w_scale:
+            w_scales_shuf = _shuffle_w_scales_cdna4_nonkdim16(w_scales_u8)
+            # (E, N//32, K) layout. Kernel expects stride_w_mx_n along the
+            # N//32-sized dim and stride_w_mx_k along the K-sized dim.
+            w_scales_stride_e = w_scales_shuf.stride(0)
+            w_scales_stride_n = w_scales_shuf.stride(1)
+            w_scales_stride_k = w_scales_shuf.stride(2)
+            w_scales_arg = w_scales_shuf
+            swizzle_mx_scale = "CDNA4_SCALE"
+            nonkdim = 16
+        else:
+            # Plain path: (E, K//32, N) column-major so the kernel's coalesced
+            # N-inner load works, matching stride_w_mx_n=1, stride_w_mx_k=N.
+            w_scales_kn = w_scales_u8.permute(0, 2, 1)
+            w_scales_stride_e = w_scales_kn.stride(0)
+            w_scales_stride_k = w_scales_kn.stride(1)
+            w_scales_stride_n = w_scales_kn.stride(2)
+            w_scales_arg = w_scales_kn
+            swizzle_mx_scale = None
+            nonkdim = matrix_instr_nonkdim
 
         hist, offs_raw, offs_pad_sum, block_pid_map, grid_m = _build_expt_data(
             group_end_offsets, M, E, BLOCK_M
@@ -412,18 +464,18 @@ if _rocm_mxfp8_available:
             input_act, input_act.stride(0), input_act.stride(1),
             x_scales_u8, x_scales_u8.stride(0), x_scales_u8.stride(1),
             w_kn, w_kn.stride(0), w_kn.stride(1), w_kn.stride(2),
-            w_scales_kn, w_scales_kn.stride(0), w_scales_kn.stride(1), w_scales_kn.stride(2),
+            w_scales_arg, w_scales_stride_e, w_scales_stride_k, w_scales_stride_n,
             N, K,
             hist, offs_raw, offs_pad_sum, block_pid_map,
             grid_m, grid_n,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
             GROUP_M=GROUP_M, XCD_SWIZZLE=XCD_SWIZZLE,
-            SWIZZLE_MX_SCALE=None,
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
             EVEN_K=(K % BLOCK_K == 0), MASK_K_LIMIT=(K % BLOCK_K),
             W_CACHE_MODIFIER=None,
             UPCAST_INDICES=False,
             num_warps=num_warps, num_stages=num_stages,
-            matrix_instr_nonkdim=matrix_instr_nonkdim, kpack=1,
+            matrix_instr_nonkdim=nonkdim, kpack=1,
             waves_per_eu=0,
         )
         return output
