@@ -337,6 +337,22 @@ if _rocm_mxfp8_available:
         )
         return hist, offs_raw, offs_pad_sum, block_pid_map, grid_m_ub
 
+    def _pick_block_nk(N: int, K: int) -> tuple:
+        """Shape-aware (BLOCK_N, BLOCK_K) pick, derived from a 36-shape sweep
+        on gfx950/MI355X across (E, M=16640, N, K) with N,K in {2048,5120,8192}.
+
+        - (N=2048, K=2048): 128/128 (best by 7.6-8.7% over 256/256)
+        - any N, K=2048:    256/128 (best by 0.2-5.4% over 256/256)
+        - else:             256/256
+
+        See /tmp/per_shape_results.pkl for the underlying data.
+        """
+        small_n = N <= 2048
+        small_k = K <= 2048
+        block_n = 128 if (small_n and small_k) else 256
+        block_k = 128 if small_k else 256
+        return block_n, block_k
+
     def triton_mxfp8_grouped_mm(
         input_act: torch.Tensor,
         weight: torch.Tensor,
@@ -345,8 +361,8 @@ if _rocm_mxfp8_available:
         group_end_offsets: torch.Tensor,
         out_dtype: torch.dtype = torch.bfloat16,
         BLOCK_M: int = 128,
-        BLOCK_N: int = 256,
-        BLOCK_K: int = 256,
+        BLOCK_N: int = None,   # None = shape-aware default
+        BLOCK_K: int = None,   # None = shape-aware default
         GROUP_M: int = 8,
         XCD_SWIZZLE: int = 8,
         num_warps: int = 8,
@@ -366,6 +382,14 @@ if _rocm_mxfp8_available:
         M, K = input_act.shape
         E, N, K2 = weight.shape
         assert K == K2, f"K mismatch: A={K}, B={K2}"
+
+        # Shape-aware default tile size: see _pick_block_nk docstring.
+        if BLOCK_N is None or BLOCK_K is None:
+            _bn, _bk = _pick_block_nk(N, K)
+            if BLOCK_N is None:
+                BLOCK_N = _bn
+            if BLOCK_K is None:
+                BLOCK_K = _bk
 
         # Column-major view of W: (E, N, K) row-major -> (E, K, N) with stride(-2)==1.
         # kernel expects W shape (E, K, N) and its W_scales shape (E, K//32, N).
