@@ -1,0 +1,127 @@
+name: MXFP8 ROCm tests (gfx950)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'rocm-mxfp8-*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mxfp8-gfx950:
+    # Self-hosted runner labels — adjust to match your runner.
+    runs-on: [self-hosted, linux, gfx950]
+    timeout-minutes: 60
+    env:
+      TORCH_INDEX: https://download.pytorch.org/whl/nightly/rocm7.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up venv + install torch nightly (rocm7.1)
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --pre torch pytorch-triton-rocm --index-url $TORCH_INDEX
+          # Upgrade to AMD's triton-rocm (newer than pytorch-triton-rocm
+          # bundled with torch nightly); gives better tl.dot_scaled codegen.
+          pip install --pre --force-reinstall --no-deps triton-rocm --index-url $TORCH_INDEX
+          pip install numpy tabulate tqdm pytest expecttest fire
+
+      - name: Install torchao (editable)
+        run: |
+          . .venv/bin/activate
+          USE_CPP=0 pip install -e . --no-build-isolation
+
+      - name: Env
+        run: |
+          . .venv/bin/activate
+          python -c "import torch, triton
+          print('torch:', torch.__version__)
+          print('hip:', torch.version.hip)
+          print('triton:', triton.__version__)
+          print('device:', torch.cuda.get_device_name(0))"
+
+      - name: MXFP8 grouped-MM accuracy tests
+        run: |
+          . .venv/bin/activate
+          pytest -v test/prototype/moe_training/test_mxfp8_grouped_mm.py 2>&1 | tee pytest.log
+
+      - name: Grouped-MM benchmark (Llama4 shapes, fwd only)
+        run: |
+          . .venv/bin/activate
+          PYTHONPATH=. python benchmarks/prototype/moe_training/bench_2d_3d_grouped_gemm.py 2>&1 | tee bench.log
+
+      - name: Grouped-MM benchmark (fwd+bwd, all 3 kernels)
+        if: always()
+        run: |
+          . .venv/bin/activate
+          PYTHONPATH=. python benchmarks/prototype/moe_training/benchmark_scaled_grouped_mm_dq.py --alignment-size 32 2>&1 | tee bench_dq.log
+
+      - name: Build bench markdown tables
+        if: always()
+        run: |
+          . .venv/bin/activate 2>/dev/null || true
+          python tools/bench_table.py bench.log > bench_table.md || true
+          python tools/bench_table.py bench_dq.log > bench_dq_table.md || true
+
+      - name: Publish run summary
+        if: always()
+        run: |
+          . .venv/bin/activate 2>/dev/null || true
+          {
+            echo "# MXFP8 ROCm (gfx950) — run summary"
+            echo
+            echo "**Commit:** \`${{ github.sha }}\`  •  **Branch:** \`${{ github.ref_name }}\`"
+            if python -c "import torch" 2>/dev/null; then
+              python -c "import torch, triton; print(f'**torch** \`{torch.__version__}\`  •  **hip** \`{torch.version.hip}\`  •  **triton** \`{triton.__version__}\`  •  **device** \`{torch.cuda.get_device_name(0)}\`')"
+            fi
+            echo
+            echo "## Accuracy — \`test/prototype/moe_training/test_mxfp8_grouped_mm.py\`"
+            echo
+            if [ -f pytest.log ]; then
+              summary=$(grep -oE "[0-9]+ passed[^=]*" pytest.log | tail -1)
+              echo "**Summary:** ${summary:-_not captured_}"
+              echo
+              fails=$(grep -E "^FAILED " pytest.log || true)
+              if [ -n "$fails" ]; then
+                echo "### Failed"; echo '```'; echo "$fails"; echo '```'
+              fi
+              echo
+              echo "_Passed: $(grep -cE " PASSED " pytest.log) • Skipped: $(grep -cE " SKIPPED " pytest.log) • Failed: $(grep -cE " FAILED " pytest.log)_"
+            else
+              echo "_pytest.log missing_"
+            fi
+            echo
+            echo "## Benchmark (fwd only) — \`bench_2d_3d_grouped_gemm.py\`"
+            echo
+            if [ -s bench_table.md ]; then
+              cat bench_table.md
+            elif [ -f bench.log ]; then
+              echo '```'; awk '/^\s*E\s+M\s+N\s+K/{p=1} p' bench.log | head -80; echo '```'
+            else
+              echo "_bench.log missing_"
+            fi
+            echo
+            echo "## Benchmark (fwd+bwd, all kernels) — \`benchmark_scaled_grouped_mm_dq.py\`"
+            echo
+            if [ -f bench_dq.log ]; then
+              echo '```'; awk '/^M,N,K,G/{p=1} p' bench_dq.log | head -40; echo '```'
+            else
+              echo "_bench_dq.log missing_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mxfp8-gfx950-logs
+          path: |
+            pytest.log
+            bench.log
+            bench_dq.log
+          if-no-files-found: warn
