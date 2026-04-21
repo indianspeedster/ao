@@ -251,46 +251,90 @@ if _rocm_mxfp8_available:
         tl.store(YPtrs, acc.to(Y.dtype.element_ty),
                  mask=mask_m[:, None] & mask_n[None, :])
 
+    @triton.jit
+    def _expt_data_kernel(
+        OffsetsPtr,             # (E,) int32 — group_end_offsets
+        HistPtr,                # (E,) int32 — output: tokens per expert
+        OffsRawPtr,             # (E,) int32 — output: prefix start offset per expert
+        OffsPadSumPtr,          # 0-d int32 — output: sum of cdiv(hist[e], BLOCK_M)
+        BlockPidMapPtr,         # (GRID_M_UB,) int32 — output: packed (block<<16)|e or -1
+        E: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        GRID_M_UB: tl.constexpr,
+    ):
+        """One-launch build of all routing tensors the MM kernel needs.
+
+        Grid is ``(GRID_M_UB,)``. Each program:
+          - recomputes cum_blocks[] in registers from OffsetsPtr (O(E) loads),
+          - writes ``HistPtr[pid]`` and ``OffsRawPtr[pid]`` when ``pid < E``,
+          - writes ``BlockPidMapPtr[pid]`` for its global block index,
+          - program 0 also writes ``OffsPadSumPtr`` (total block count).
+
+        Replaces a chain of cat/diff/cumsum/arange/searchsorted/clamp/shift/where
+        (~30-40 us of host-visible launch overhead) with a single ~2-3 us launch.
+        """
+        pid = tl.program_id(0)
+
+        # Walk the E offsets in lockstep on every program. This is cheap:
+        # with E<=8 and a coalesced load per step, it's ~E SLC loads.
+        offs_prev = tl.zeros((), dtype=tl.int32)
+        cum = tl.zeros((), dtype=tl.int32)
+        target_e = tl.zeros((), dtype=tl.int32)
+        target_block = tl.zeros((), dtype=tl.int32)
+        valid = tl.full((), 0, dtype=tl.int1)
+
+        for e in tl.static_range(E):
+            off = tl.load(OffsetsPtr + e).to(tl.int32)
+            h = off - offs_prev
+            # First E programs also persist hist[e] and offs_raw[e].
+            if pid == e:
+                tl.store(HistPtr + e, h)
+                tl.store(OffsRawPtr + e, offs_prev)
+            blocks_e = (h + BLOCK_M - 1) // BLOCK_M
+            cum_next = cum + blocks_e
+            # Does this pid belong to expert e?
+            owned = (pid >= cum) & (pid < cum_next)
+            target_e = tl.where(owned, e, target_e)
+            target_block = tl.where(owned, pid - cum, target_block)
+            valid = valid | owned
+            cum = cum_next
+            offs_prev = off
+
+        # Write block_pid_map[pid] and (once) offs_pad_sum.
+        value = tl.where(valid, (target_block << 16) | target_e, tl.full((), -1, dtype=tl.int32))
+        tl.store(BlockPidMapPtr + pid, value)
+        if pid == 0:
+            tl.store(OffsPadSumPtr, cum)
+
     def _build_expt_data(
         group_end_offsets: torch.Tensor, M: int, E: int, block_m: int
     ):
-        """Build (hist, offs_raw, offs_pad_sum, block_pid_map, grid_m_ub) from
-        group offsets without any d2h sync. Computed entirely on the device so
-        we stay torch.compile-clean.
+        """Single-kernel build of (hist, offs_raw, offs_pad_sum, block_pid_map,
+        grid_m_ub) from ``group_end_offsets``. Sync-free, torch.compile-clean.
 
-        block_pid_map is over-allocated to an upper bound ``cdiv(M, block_m) + E``;
-        tail positions are ``-1`` and the kernel early-exits on them.
-        ``grid_m_ub`` is a Python int (derived from M and E, both host-known).
+        Allocates one combined int32 buffer for all four outputs so we only
+        pay one ``torch.empty`` Python call plus one kernel launch.
         """
         device = group_end_offsets.device
-        zero = torch.zeros(1, dtype=torch.int32, device=device)
-        offs_i32 = group_end_offsets.to(torch.int32)
-        offs_with_zero = torch.cat([zero, offs_i32])
-        hist = offs_with_zero[1:] - offs_with_zero[:-1]              # (E,) int32
-        offs_raw = offs_with_zero[:E].contiguous()                   # (E,) int32
-
-        blocks_per_expert = (hist + block_m - 1) // block_m          # (E,) int32
-        cum_blocks = torch.cat([
-            zero, blocks_per_expert.cumsum(0).to(torch.int32)
-        ])                                                           # (E+1,) int32
-        offs_pad_sum = cum_blocks[-1]                                # 0-d int32
-
-        # Safe upper bound for grid_m: a group may contribute at most
-        # cdiv(group_size, block_m) tiles, and sum_g group_size == M.
-        # Each group rounds up by at most (block_m-1)/block_m of a tile, so
-        # total blocks <= cdiv(M, block_m) + E - 1.
-        import triton
         grid_m_ub = triton.cdiv(M, block_m) + max(E - 1, 0)
 
-        pids = torch.arange(grid_m_ub, dtype=torch.int32, device=device)
-        # For each pid, find expert e such that cum_blocks[e] <= pid < cum_blocks[e+1].
-        # right=True makes searchsorted treat equal values as "strictly greater"
-        # for the upper bound, so subtracting 1 gives the owning expert.
-        e_idx = (torch.searchsorted(cum_blocks, pids, right=True) - 1).clamp(min=0, max=E - 1)
-        block_in_e = pids - cum_blocks[e_idx]
-        value = (block_in_e.to(torch.int32) << 16) | e_idx.to(torch.int32)
-        invalid = pids >= offs_pad_sum
-        block_pid_map = torch.where(invalid, torch.full_like(value, -1), value)
+        # Single backing allocation: [hist (E) | offs_raw (E) | pad_sum (1) | bpm (GRID_M_UB)]
+        total = 2 * E + 1 + grid_m_ub
+        buf = torch.empty(total, dtype=torch.int32, device=device)
+        hist = buf[:E]
+        offs_raw = buf[E:2 * E]
+        offs_pad_sum = buf[2 * E]                      # 0-d view
+        block_pid_map = buf[2 * E + 1:]
+
+        offs_i32 = group_end_offsets if group_end_offsets.dtype == torch.int32 \
+            else group_end_offsets.to(torch.int32)
+
+        _expt_data_kernel[(grid_m_ub,)](
+            offs_i32,
+            hist, offs_raw, offs_pad_sum, block_pid_map,
+            E=E, BLOCK_M=block_m, GRID_M_UB=grid_m_ub,
+            num_warps=1,
+        )
         return hist, offs_raw, offs_pad_sum, block_pid_map, grid_m_ub
 
     def triton_mxfp8_grouped_mm(
