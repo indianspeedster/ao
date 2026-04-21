@@ -1121,13 +1121,15 @@ def round_up(x, y):
 
 
 def _rocm_grouped_mm_cfg(E: int, N: int) -> dict:
-    """Tile + scheduling config for the ROCm grouped-MM kernel.
+    """Scheduling config for the ROCm grouped-MM kernel.
 
-    Picked via parallel 192-config sweep on MI355X across (E, M=16640, N, K)
-    in {1,2,4,8} x {2048,5120,8192} x {2048,5120,8192}.
+    Picked via a 192-config sweep (fixed-config), then refined by a 864-run
+    per-shape sweep on MI355X across (E, M=16640, N, K) with N,K in
+    {2048, 5120, 8192}. BLOCK_N/BLOCK_K are left unset so the wrapper's
+    shape-aware ``_pick_block_nk`` helper picks them from ``(N, K)``.
     """
     return dict(
-        BLOCK_M=128, BLOCK_N=256, BLOCK_K=256,
+        BLOCK_M=128,
         GROUP_M=8, XCD_SWIZZLE=8,
         num_warps=8, num_stages=2,
         matrix_instr_nonkdim=32,
