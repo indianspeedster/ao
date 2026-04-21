@@ -338,20 +338,22 @@ if _rocm_mxfp8_available:
         return hist, offs_raw, offs_pad_sum, block_pid_map, grid_m_ub
 
     def _pick_block_nk(N: int, K: int) -> tuple:
-        """Shape-aware (BLOCK_N, BLOCK_K) pick, derived from a 36-shape sweep
-        on gfx950/MI355X across (E, M=16640, N, K) with N,K in {2048,5120,8192}.
+        """Shape-aware (BLOCK_N, BLOCK_K) pick, derived from an 864-run
+        per-shape sweep on gfx950/MI355X across (E, M=16640, N, K) with
+        N,K in {2048, 5120, 8192}.
 
-        - (N=2048, K=2048): 128/128 (best by 7.6-8.7% over 256/256)
-        - any N, K=2048:    256/128 (best by 0.2-5.4% over 256/256)
-        - else:             256/256
+        - (N=2048, K=2048): 128/128 (best by 7.6-8.7% over 256/256 in sweep;
+          +0.02 to +0.15x speedup-vs-bf16 in full bench, consistent wins)
+        - else: 256/256
 
-        See /tmp/per_shape_results.pkl for the underlying data.
+        The ``(K=2048, N>=5120) -> 256/128`` arm was dropped: the sweep
+        showed only 1-5% gains there, which got swallowed by the >=5-15%
+        run-to-run noise of the 36-shape bench (bf16 baseline itself swings
+        that much between runs on our CI runner).
         """
-        small_n = N <= 2048
-        small_k = K <= 2048
-        block_n = 128 if (small_n and small_k) else 256
-        block_k = 128 if small_k else 256
-        return block_n, block_k
+        if N <= 2048 and K <= 2048:
+            return 128, 128
+        return 256, 256
 
     def triton_mxfp8_grouped_mm(
         input_act: torch.Tensor,
