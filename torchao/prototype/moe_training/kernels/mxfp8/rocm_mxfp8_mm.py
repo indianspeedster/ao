@@ -73,10 +73,25 @@ if _rocm_mxfp8_available:
         MX_SCALE_BLOCK_K: tl.constexpr,
         N_PRESHUFFLE_FACTOR: tl.constexpr = 32,
     ):
+        """Inverse of host-side shuffle for nonkdim=16 MFMA."""
         x = x.reshape(
             BLOCK_N // N_PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K // 8, 4, 16, 2, 2, 1
         )
         x = x.permute(0, 5, 3, 1, 4, 2, 6)
+        return x.reshape(BLOCK_N, MX_SCALE_BLOCK_K)
+
+    @triton.jit
+    def _unswizzle_mx_scale_cdna4_nonkdim32(
+        x,
+        BLOCK_N: tl.constexpr,
+        MX_SCALE_BLOCK_K: tl.constexpr,
+        N_PRESHUFFLE_FACTOR: tl.constexpr = 32,
+    ):
+        """Inverse of host-side shuffle for nonkdim=32 MFMA (from tutorial 10)."""
+        x = x.reshape(
+            BLOCK_N // N_PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K // 8, 2, 32, 4, 1
+        )
+        x = x.permute(0, 3, 1, 4, 2, 5)
         return x.reshape(BLOCK_N, MX_SCALE_BLOCK_K)
 
     @triton.jit
@@ -99,6 +114,8 @@ if _rocm_mxfp8_available:
         XCD_SWIZZLE: tl.constexpr,
         # "CDNA4_SCALE" enables pre-shuffled MX scale layout; None = plain.
         SWIZZLE_MX_SCALE: tl.constexpr,
+        # Which CDNA4 shuffle formula: 16 or 32. Must match matrix_instr_nonkdim.
+        SCALE_NONKDIM: tl.constexpr,
         EVEN_K: tl.constexpr,
         MASK_K_LIMIT: tl.constexpr,
         W_CACHE_MODIFIER: tl.constexpr,
@@ -213,13 +230,22 @@ if _rocm_mxfp8_available:
             x = tl.load(XPtrs)
             w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
             if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-                x_scales = _unswizzle_mx_scale_cdna4(
-                    tl.load(XMxScalePtrs), BLOCK_M, MX_SCALE_BLOCK_K,
-                )
-                w_scales = _unswizzle_mx_scale_cdna4(
-                    tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
-                    BLOCK_N, MX_SCALE_BLOCK_K,
-                )
+                if SCALE_NONKDIM == 32:
+                    x_scales = _unswizzle_mx_scale_cdna4_nonkdim32(
+                        tl.load(XMxScalePtrs), BLOCK_M, MX_SCALE_BLOCK_K,
+                    )
+                    w_scales = _unswizzle_mx_scale_cdna4_nonkdim32(
+                        tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                        BLOCK_N, MX_SCALE_BLOCK_K,
+                    )
+                else:
+                    x_scales = _unswizzle_mx_scale_cdna4(
+                        tl.load(XMxScalePtrs), BLOCK_M, MX_SCALE_BLOCK_K,
+                    )
+                    w_scales = _unswizzle_mx_scale_cdna4(
+                        tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                        BLOCK_N, MX_SCALE_BLOCK_K,
+                    )
             else:
                 x_scales = tl.load(XMxScalePtrs)
                 w_scales = tl.load(WMxScalePtrs)
@@ -244,13 +270,22 @@ if _rocm_mxfp8_available:
             w = tl.load(WPtrs, mask=mask_w_k[:, None], other=0.0,
                         cache_modifier=W_CACHE_MODIFIER)
             if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-                x_scales = _unswizzle_mx_scale_cdna4(
-                    tl.load(XMxScalePtrs), BLOCK_M, MX_SCALE_BLOCK_K,
-                )
-                w_scales = _unswizzle_mx_scale_cdna4(
-                    tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
-                    BLOCK_N, MX_SCALE_BLOCK_K,
-                )
+                if SCALE_NONKDIM == 32:
+                    x_scales = _unswizzle_mx_scale_cdna4_nonkdim32(
+                        tl.load(XMxScalePtrs), BLOCK_M, MX_SCALE_BLOCK_K,
+                    )
+                    w_scales = _unswizzle_mx_scale_cdna4_nonkdim32(
+                        tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                        BLOCK_N, MX_SCALE_BLOCK_K,
+                    )
+                else:
+                    x_scales = _unswizzle_mx_scale_cdna4(
+                        tl.load(XMxScalePtrs), BLOCK_M, MX_SCALE_BLOCK_K,
+                    )
+                    w_scales = _unswizzle_mx_scale_cdna4(
+                        tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                        BLOCK_N, MX_SCALE_BLOCK_K,
+                    )
             else:
                 x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
                 w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
@@ -388,6 +423,23 @@ if _rocm_mxfp8_available:
         x = x.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
         return x.reshape(M // 32, Ks * 32)
 
+    def _shuffle_w_scales_cdna4_nonkdim32(w_scales: torch.Tensor) -> torch.Tensor:
+        """nonkdim=32 variant of the W-scale shuffle. Consumed by
+        ``_unswizzle_mx_scale_cdna4_nonkdim32`` in the kernel. Output:
+        (E, N//32, K). Requires N % 32 == 0, K % 256 == 0."""
+        E, N, Ks = w_scales.shape
+        x = w_scales.reshape(E, N // 32, 32, Ks // 8, 4, 2, 1)
+        x = x.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
+        return x.reshape(E, N // 32, Ks * 32)
+
+    def _shuffle_x_scales_cdna4_nonkdim32(x_scales: torch.Tensor) -> torch.Tensor:
+        """nonkdim=32 variant of the X-scale shuffle. Output (M//32, K).
+        Requires M % 32 == 0, K % 256 == 0."""
+        M, Ks = x_scales.shape
+        x = x_scales.reshape(M // 32, 32, Ks // 8, 4, 2, 1)
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
+        return x.reshape(M // 32, Ks * 32)
+
     def _pick_block_nk(N: int, K: int) -> tuple:
         """Shape-aware (BLOCK_N, BLOCK_K) pick, derived from an 864-run
         per-shape sweep on gfx950/MI355X across (E, M=16640, N, K) with
@@ -471,24 +523,29 @@ if _rocm_mxfp8_available:
         w_scales_u8 = weight_scales.view(torch.uint8)
 
         if use_cdna4_scale:
+            # Scale-shuffle variant. Benchmarking across 15 Llama4/DSv3
+            # shapes showed the nk16 pair (16x16x128 MFMA + nk16 shuffle)
+            # geomean-faster than the nk32 pair (32x32x64 MFMA + nk32
+            # shuffle) by ~3.1%, despite nk32 being a clear win on a few
+            # dsv3 w_gate shapes (up to 24%). Default to nk16 and keep
+            # the nk32 helpers for future per-shape selection. The
+            # MFMA's nk here is forced to match the shuffle nk — that
+            # constraint is what makes nk16 the CDNA4_SCALE default even
+            # when the caller passed ``matrix_instr_nonkdim=32``.
             w_scales_shuf = _shuffle_w_scales_cdna4_nonkdim16(w_scales_u8)
-            # (E, N//32, K) layout. Kernel expects stride_w_mx_n along the
-            # N//32-sized dim and stride_w_mx_k along the K-sized dim.
+            x_scales_shuf = _shuffle_x_scales_cdna4_nonkdim16(x_scales_u8)
+            nonkdim = 16
+
             w_scales_arg = w_scales_shuf
             w_scales_stride_e = w_scales_shuf.stride(0)
             w_scales_stride_n = w_scales_shuf.stride(1)
             w_scales_stride_k = w_scales_shuf.stride(2)
 
-            x_scales_shuf = _shuffle_x_scales_cdna4_nonkdim16(x_scales_u8)
-            # (M//32, K) layout. stride(0) is along the M//32-dim (which
-            # the kernel advances per-expert via start_m//32), stride(1)
-            # is the K-dim step.
             x_scales_arg = x_scales_shuf
             x_scales_stride_m = x_scales_shuf.stride(0)
             x_scales_stride_k = x_scales_shuf.stride(1)
 
             swizzle_mx_scale = "CDNA4_SCALE"
-            nonkdim = 16
         else:
             # Plain path: W (E, K//32, N), X (M, K//32).
             w_scales_kn = w_scales_u8.permute(0, 2, 1)
@@ -524,6 +581,7 @@ if _rocm_mxfp8_available:
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
             GROUP_M=GROUP_M, XCD_SWIZZLE=XCD_SWIZZLE,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SCALE_NONKDIM=nonkdim,
             EVEN_K=(K % BLOCK_K == 0), MASK_K_LIMIT=(K % BLOCK_K),
             W_CACHE_MODIFIER=None,
             UPCAST_INDICES=False,
