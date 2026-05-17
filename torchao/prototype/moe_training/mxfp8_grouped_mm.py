@@ -515,6 +515,23 @@ def _compute_wgrad(
         )
 
 
+def _extract_or_quantize_dim0_auto(
+    tensor: torch.Tensor,
+    block_size: int,
+    scale_calculation_mode: ScaleCalculationMode,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AUTO path: extract qdata/scales from an MXTensor, otherwise quantize via
+    the Triton dim0 kernel. Used by the ROCm grouped-MM compute paths."""
+    if isinstance(tensor, MXTensor):
+        return tensor.qdata, tensor.scale
+    qdata, scale = triton_to_mxfp8_dim0(
+        tensor,
+        inner_block_size=block_size,
+        scaling_mode=str(scale_calculation_mode.value).lower(),
+    )
+    return qdata, scale
+
+
 def _extract_or_quantize_1x32_emulated(
     tensor: torch.Tensor,
     block_size: int,
