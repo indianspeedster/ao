@@ -314,10 +314,9 @@ if _rocm_mxfp8_available:
         HistPtr,                # (E,) int32 — output: tokens per expert
         OffsRawPtr,             # (E,) int32 — output: prefix start offset per expert
         OffsPadSumPtr,          # 0-d int32 — output: sum of cdiv(hist[e], BLOCK_M)
-        BlockPidMapPtr,         # (GRID_M_UB,) int32 — output: packed (block<<16)|e or -1
+        BlockPidMapPtr,         # (grid_m_ub,) int32 — output: packed (block<<16)|e or -1
         E: tl.constexpr,
         BLOCK_M: tl.constexpr,
-        GRID_M_UB: tl.constexpr,
     ):
         """One-launch build of all routing tensors the MM kernel needs.
 
@@ -389,7 +388,7 @@ if _rocm_mxfp8_available:
         _expt_data_kernel[(grid_m_ub,)](
             offs_i32,
             hist, offs_raw, offs_pad_sum, block_pid_map,
-            E=E, BLOCK_M=block_m, GRID_M_UB=grid_m_ub,
+            E=E, BLOCK_M=block_m,
             num_warps=1,
         )
         return hist, offs_raw, offs_pad_sum, block_pid_map, grid_m_ub

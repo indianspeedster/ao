@@ -746,9 +746,15 @@ if _triton_kernels_available:
 
     @triton.autotune(
         configs=_get_mxfp8_quant_autotune_configs(),
-        # Include n_rows so small activation tensors get a different tuned
-        # config from large weight tensors that share the same n_cols.
-        key=["n_rows", "n_cols", "SCALE_BLOCK_SIZE"],
+        # Note: previously included n_rows here so small activation tensors
+        # get a different tuned config from large weight tensors that share
+        # the same n_cols. But under jagged MoE routing
+        # (force_load_balance=False) n_rows varies every training step, which
+        # triggers a fresh 32-candidate autotune per step and adds ~200 s of
+        # per-step compile cost. Dropping n_rows from the key trades some
+        # tuning quality on small-activation shapes for stable shape→config
+        # caching across steps.
+        key=["n_cols", "SCALE_BLOCK_SIZE"],
     )
     @triton.jit
     def to_mxfp8_dim0_kernel(
