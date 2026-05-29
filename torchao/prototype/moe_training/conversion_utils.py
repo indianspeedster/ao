@@ -11,6 +11,7 @@ from torch import nn
 
 from torchao.prototype.moe_training.config import (
     Float8TrainingOpConfig,
+    MXFP4TrainingOpConfig,
     MXFP8TrainingOpConfig,
     TrainingOpBaseConfig,
 )
@@ -26,6 +27,7 @@ def _get_tensor_cls_for_config(
     """
     from torchao.prototype.moe_training.tensor import (
         Float8TrainingWeightWrapperTensor,
+        MXFP4TrainingWeightWrapperTensor,
         MXFP8TrainingWeightWrapperTensor,
     )
 
@@ -41,6 +43,8 @@ def _get_tensor_cls_for_config(
         )
 
         return MXFP8TrainingWeightWrapperTensor
+    elif isinstance(config, MXFP4TrainingOpConfig):
+        return MXFP4TrainingWeightWrapperTensor
     elif isinstance(config, Float8TrainingOpConfig):
         return Float8TrainingWeightWrapperTensor
     else:

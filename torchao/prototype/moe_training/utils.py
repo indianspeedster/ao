@@ -9,6 +9,7 @@ from torchao.float8.config import ScalingGranularity
 from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
 from torchao.prototype.moe_training.config import (
     Float8TrainingOpConfig,
+    MXFP4TrainingOpConfig,
     MXFP8TrainingOpConfig,
     TrainingOpBaseConfig,
 )
@@ -376,6 +377,7 @@ def _quantize_then_scaled_grouped_mm(
     """
     from torchao.prototype.moe_training import (
         _to_fp8_rowwise_then_scaled_grouped_mm,
+        _to_mxfp4_then_scaled_grouped_mm,
         _to_mxfp8_then_scaled_grouped_mm,
     )
 
@@ -404,6 +406,15 @@ def _quantize_then_scaled_grouped_mm(
             B_t,
             offs,
             **kwargs,
+        )
+    elif isinstance(config, MXFP4TrainingOpConfig):
+        return _to_mxfp4_then_scaled_grouped_mm(
+            A,
+            B_t,
+            offs,
+            out_dtype=config.out_dtype,
+            wgrad_with_hp=config.wgrad_with_hp,
+            scale_calculation_mode=config.scale_calculation_mode,
         )
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")

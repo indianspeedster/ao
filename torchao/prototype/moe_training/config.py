@@ -35,6 +35,13 @@ class MXFP8TrainingRecipe(Enum):
     MXFP8_EMULATED_RCEIL = "mxfp8_emulated_rceil"
 
 
+class MXFP4TrainingRecipe(Enum):
+    """MXFP4 recipes for grouped matrix multiplication (ROCm gfx950 only)."""
+
+    MXFP4_RCEIL = "mxfp4_rceil"
+    MXFP4_RCEIL_WGRAD_WITH_HP = "mxfp4_rceil_wgrad_with_hp"
+
+
 class TrainingOpBaseConfig(AOBaseConfig):
     """
     Base configuration for low precision training. Not intended to be used directly.
@@ -227,8 +234,66 @@ class MXFP8TrainingOpConfig(TrainingOpBaseConfig):
         )
 
 
+# register as pytree constant so we can use dynamo nonstrict trace in torchao.prototype.moe_training.ep
+@register_as_pytree_constant
+@dataclass
+class MXFP4TrainingOpConfig(TrainingOpBaseConfig):
+    """
+    Configuration for MXFP4 MoE training (ROCm gfx950 only).
+
+    All three GEMMs (fwd/dgrad/wgrad) run in MXFP4 by default. Set
+    wgrad_with_hp=True to keep wgrad in bf16 for higher precision.
+    """
+
+    out_dtype: Optional[torch.dtype] = torch.bfloat16
+    wgrad_with_hp: bool = False
+    scale_calculation_mode: ScaleCalculationMode = ScaleCalculationMode.RCEIL
+    pad_token_groups_for_grouped_mm: bool = False
+
+    @classmethod
+    def from_recipe(cls, recipe: MXFP4TrainingRecipe) -> "MXFP4TrainingOpConfig":
+        if recipe == MXFP4TrainingRecipe.MXFP4_RCEIL:
+            return cls(
+                out_dtype=torch.bfloat16,
+                wgrad_with_hp=False,
+                scale_calculation_mode=ScaleCalculationMode.RCEIL,
+                pad_token_groups_for_grouped_mm=False,
+            )
+        elif recipe == MXFP4TrainingRecipe.MXFP4_RCEIL_WGRAD_WITH_HP:
+            return cls(
+                out_dtype=torch.bfloat16,
+                wgrad_with_hp=True,
+                scale_calculation_mode=ScaleCalculationMode.RCEIL,
+                pad_token_groups_for_grouped_mm=False,
+            )
+        else:
+            raise ValueError(f"Unsupported MXFP4 recipe: {recipe}")
+
+    def __eq__(self, other):
+        if isinstance(other, MXFP4TrainingOpConfig):
+            return (
+                self.out_dtype == other.out_dtype
+                and self.wgrad_with_hp == other.wgrad_with_hp
+                and self.scale_calculation_mode == other.scale_calculation_mode
+                and self.pad_token_groups_for_grouped_mm
+                == other.pad_token_groups_for_grouped_mm
+            )
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(
+            (
+                self.out_dtype,
+                self.wgrad_with_hp,
+                self.scale_calculation_mode,
+                self.pad_token_groups_for_grouped_mm,
+            )
+        )
+
+
 @register_quantize_module_handler(Float8TrainingOpConfig)
 @register_quantize_module_handler(MXFP8TrainingOpConfig)
+@register_quantize_module_handler(MXFP4TrainingOpConfig)
 def _moe_training_transform(
     module: nn.Module,
     config: TrainingOpBaseConfig,

@@ -16,6 +16,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from torchao.prototype.moe_training.config import (
+    MXFP4TrainingOpConfig,
     MXFP8TrainingOpConfig,
     TrainingOpBaseConfig,
 )
@@ -335,3 +336,39 @@ class MXFP8TrainingWeightWrapperTensor(TrainingWeightWrapperBaseTensor):
             # the wrapping behavior of the super() impl, go directly to dispatch
             with torch._C.DisableTorchFunctionSubclass():
                 return func(*args, **kwargs)
+
+
+
+class MXFP4TrainingWeightWrapperTensor(TrainingWeightWrapperBaseTensor):
+    """
+    Weight wrapper for MXFP4 MoE training on ROCm gfx950.
+
+    Overrides `_grouped_mm` to dispatch through the MXFP4 autograd function
+    so routed experts use MXFP4 fwd/dgrad/wgrad. Dense `linear`/`mm`/`matmul`
+    falls back to bf16 via the standard torch impl — MXFP4 dense matmul is
+    available but not wired here yet (shared experts typically stay in bf16).
+    """
+
+    @classmethod
+    def __torch_function__(cls, func, types, args, kwargs={}):
+        if func.__name__ == "_grouped_mm":
+            A, B = args[0], args[1]
+            assert not isinstance(A, cls), f"A should not be a {cls.__name__}"
+            assert isinstance(B, cls), f"B should be a {cls.__name__}"
+
+            config = B.config
+            offs = kwargs.get("offs", None)
+            A_is_2d = A.ndim == 2
+            B_is_3d = B.ndim == 3
+
+            if A_is_2d and B_is_3d and offs is not None:
+                return _quantize_then_scaled_grouped_mm(
+                    A,
+                    unwrap_weight(B),
+                    offs=offs,
+                    config=config,
+                )
+
+        # Everything else: regular op on the unwrapped tensor
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **kwargs)
