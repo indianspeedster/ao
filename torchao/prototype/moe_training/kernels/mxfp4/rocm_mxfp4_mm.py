@@ -142,11 +142,18 @@ if _rocm_mxfp4_available:
         assert Kp == Kp2
         SCALE_BLOCK = 32
 
-        output = torch.empty((M, N), dtype=out_dtype, device=input_act.device)
+        # Zero-init (not empty): rows past the last group offset (e.g. padding
+        # tokens) are never written by the kernel and must read back as 0, not
+        # uninitialized garbage (which can be NaN/inf and poison the loss).
+        output = torch.zeros((M, N), dtype=out_dtype, device=input_act.device)
 
-        grid_m_bound = max_M_per_expert if max_M_per_expert > 0 else M
+        # The M grid must cover the LARGEST group, not the average. MoE routing
+        # is imbalanced, so any single expert can receive up to M tokens; a grid
+        # bound of max_M_per_expert (= ceil(M/E)) leaves the tail of hot experts'
+        # groups uncomputed. Bound by M so cdiv(M, BLOCK_M) m-blocks cover every
+        # group; blocks past a group's end early-return via the m_base guard.
         grid = (
-            triton.cdiv(grid_m_bound, BLOCK_M),
+            triton.cdiv(M, BLOCK_M),
             triton.cdiv(N, BLOCK_N),
             E,
         )
