@@ -106,15 +106,15 @@ class _MXFP4GroupedMM(torch.autograd.Function):
             weight_t.transpose(-2, -1).contiguous(), block_size, scale_calculation_mode
         )
 
-        M = a_packed.shape[0]
-        E = w_packed.shape[0]
-        max_M_per_expert = (M + E - 1) // E
-
+        # NOTE: do NOT bound the grid by the average group size (M // E): with
+        # imbalanced token routing a hot expert exceeds the average, leaving its
+        # extra output rows uncovered by the grid -> uninitialized (torch.empty)
+        # -> NaN. Default (max_M_per_expert=0) sizes the m-grid to the full M so
+        # any single group is fully covered; out-of-range blocks early-return.
         output = triton_mxfp4_grouped_mm(
             a_packed, w_packed, a_scale, w_scale,
             group_end_offsets,
             out_dtype=out_dtype,
-            max_M_per_expert=max_M_per_expert,
         )
 
         # Save for backward (keep hp inputs for wgrad path)
@@ -144,15 +144,13 @@ class _MXFP4GroupedMM(torch.autograd.Function):
             weight_t.contiguous(), block_size, scale_calculation_mode
         )
 
-        M = go_packed.shape[0]
-        E = wt_packed.shape[0]
-        max_M_per_expert = (M + E - 1) // E
-
+        # See the forward note: full-M grid (max_M_per_expert=0) so the largest
+        # token group is fully covered; passing the average undersizes the grid
+        # for imbalanced routing and leaves uninitialized -> NaN grad rows.
         grad_input = triton_mxfp4_grouped_mm(
             go_packed, wt_packed, go_scale, wt_scale,
             group_end_offsets,
             out_dtype=out_dtype,
-            max_M_per_expert=max_M_per_expert,
         )
 
         # ----- wgrad: grad_weight = grad_output^T @ input_act -----
@@ -167,18 +165,18 @@ class _MXFP4GroupedMM(torch.autograd.Function):
             )
             grad_weight_t = grad_weight.transpose(-2, -1)
         else:
-            # MXFP4 wgrad: quantize both inputs along dim1 (the M/token dimension)
-            go_hp = _dequantize_if_mxtensor(grad_output, block_size).contiguous()
-            ia_hp = _dequantize_if_mxtensor(input_act, block_size).contiguous()
+            # MXFP4 wgrad: quantize both inputs along the M/token (reduction) dim.
+            # The fused dim1 kernel reads row-major and transposes in registers,
+            # so no transpose().contiguous() materialization is needed.
+            from torchao.prototype.moe_training.kernels.mxfp4 import (
+                triton_to_mxfp4_dim1,
+            )
 
-            # Transpose so dim0 becomes the M dimension, then quantize along dim0
-            # dim1-of-(M,N) = dim0-of-(N,M)
-            go_dim1_packed, go_dim1_scale = _to_mxfp4(
-                go_hp.transpose(-2, -1).contiguous(), block_size, scale_calculation_mode
-            )  # (N, M//2), (N, M//32)
-            ia_dim1_packed, ia_dim1_scale = _to_mxfp4(
-                ia_hp.transpose(-2, -1).contiguous(), block_size, scale_calculation_mode
-            )  # (K, M//2), (K, M//32)
+            go_hp = _dequantize_if_mxtensor(grad_output, block_size)
+            ia_hp = _dequantize_if_mxtensor(input_act, block_size)
+
+            go_dim1_packed, go_dim1_scale = triton_to_mxfp4_dim1(go_hp)  # (N, M//2), (N, M//32)
+            ia_dim1_packed, ia_dim1_scale = triton_to_mxfp4_dim1(ia_hp)  # (K, M//2), (K, M//32)
 
             grad_weight = triton_mxfp4_wgrad(
                 go_dim1_packed, go_dim1_scale,

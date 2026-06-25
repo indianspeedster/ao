@@ -39,6 +39,39 @@ if _rocm_mxfp4_available:
 
     # ==================== Grouped GEMM (fwd / dgrad) ====================
 
+    # Autotune over tile shape + pipeline depth. The original default
+    # (128/128/128, num_stages=2) starves the matrix cores: the disassembly
+    # shows every mfma group stalling on s_waitcnt lgkmcnt (LDS reads), so the
+    # v_mfma_scale_f32_32x32x64_f8f6f4 units idle ~80% of the time (~18% MFU).
+    # Larger BLOCK_K and deeper pipelines raise arithmetic intensity per LDS
+    # round-trip and keep the mfmas fed (up to ~30% MFU measured).
+    # Keyed on (N, K) ONLY: the weight dims are static per layer, while M (the
+    # routed-token count) changes every step, so keying on M would retune
+    # constantly. The tile chosen for a given (N, K) is reused across all M.
+    # BLOCK_K (the reduction tile) is the dominant lever — raising it from 128 to
+    # 256 is what unstarves the mfmas on the real MoE shapes. We deliberately keep
+    # BLOCK_N=128: BLOCK_N=256 only helped a synthetic square GEMM and *regresses*
+    # the MoE projections (N=1408/2048 leaves a half-empty 256 tile), and under the
+    # MI355X's noisy idle clocks the autotuner would occasionally mis-pick it.
+    _GROUPED_GEMM_CONFIGS = [
+        triton.Config(
+            {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk},
+            num_warps=w,
+            num_stages=s,
+        )
+        for (bm, bn, bk, w, s) in [
+            (128, 128, 128, 8, 2),   # original default / safe fallback
+            (128, 128, 256, 4, 2),   # robust winner on real MoE shapes
+            (128, 128, 256, 8, 2),
+            (256, 128, 256, 8, 2),
+            (256, 128, 256, 8, 3),
+            (128, 128, 512, 8, 2),   # very large K (e.g. 671B gate-up K=7168)
+        ]
+    ]
+
+    # Longer warmup/rep so the autotuner's internal timing is robust to the
+    # MI355X power-state swings (sclk can idle at ~96 MHz between calls).
+    @triton.autotune(configs=_GROUPED_GEMM_CONFIGS, key=["N", "K"], warmup=50, rep=200)
     @triton.jit
     def _mxfp4_grouped_mm_kernel(
         # A: packed fp4 (M, K//2) uint8
@@ -82,29 +115,37 @@ if _rocm_mxfp4_available:
         SUB_PER_BLOCK_K: tl.constexpr = BLOCK_K // SCALE_BLOCK
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        num_outer = K // BLOCK_K
+        # Reduction over K in BLOCK_K-element tiles. Use cdiv + K-dim masking so
+        # BLOCK_K need NOT divide K: the autotuner may pick BLOCK_K=256 while a
+        # down projection has K=1408. Tail fp4 elements load as 0 (scale 2^0), so
+        # they contribute nothing to the dot.
+        Kp = K // 2
+        Ksc = K // SCALE_BLOCK
+        num_outer = tl.cdiv(K, BLOCK_K)
         for k_outer in range(0, num_outer):
             kp_offs = k_outer * BLOCK_KP + tl.arange(0, BLOCK_KP)
+            kp_mask = kp_offs < Kp
 
             # Load A: (BLOCK_M, BLOCK_KP) packed uint8
             a = tl.load(
                 A_ptr + m_offs[:, None] * A_stride_m + kp_offs[None, :] * A_stride_kp,
-                mask=m_mask[:, None], other=0,
+                mask=m_mask[:, None] & kp_mask[None, :], other=0,
             )
             # Load B: (BLOCK_KP, BLOCK_N) packed uint8
             b = tl.load(
                 B_ptr + pid_g * B_stride_e + n_offs[None, :] * B_stride_n + kp_offs[:, None] * B_stride_kp,
-                mask=n_mask[None, :], other=0,
+                mask=n_mask[None, :] & kp_mask[:, None], other=0,
             )
 
             kb_offs = k_outer * SUB_PER_BLOCK_K + tl.arange(0, SUB_PER_BLOCK_K)
+            kb_mask = kb_offs < Ksc
             a_scale = tl.load(
                 A_scales_ptr + m_offs[:, None] * A_scales_stride_m + kb_offs[None, :] * A_scales_stride_kb,
-                mask=m_mask[:, None], other=127,
+                mask=m_mask[:, None] & kb_mask[None, :], other=127,
             )
             b_scale = tl.load(
                 B_scales_ptr + pid_g * B_scales_stride_e + n_offs[:, None] * B_scales_stride_n + kb_offs[None, :] * B_scales_stride_kb,
-                mask=n_mask[:, None], other=127,
+                mask=n_mask[:, None] & kb_mask[None, :], other=127,
             )
 
             # tl.dot_scaled with "e2m1" interprets uint8 tiles as packed fp4
@@ -124,17 +165,13 @@ if _rocm_mxfp4_available:
         weight_scales: torch.Tensor,      # (E, N, K//32) e8m0
         group_end_offsets: torch.Tensor,
         out_dtype: torch.dtype = torch.bfloat16,
-        BLOCK_M: int = 128,
-        BLOCK_N: int = 128,
-        BLOCK_K: int = 128,
-        num_warps: int = 8,
-        num_stages: int = 2,
         max_M_per_expert: int = 0,
     ) -> torch.Tensor:
         """
         MXFP4 grouped GEMM: output[g] = input_act[group_g] @ weight[g]^T
 
-        Inputs are fp4 packed 2-per-byte. BLOCK_K counts fp4 elements.
+        Inputs are fp4 packed 2-per-byte. Tile shape / pipeline depth are chosen
+        by @triton.autotune (keyed on N, K).
         """
         M, Kp = input_act.shape
         K = Kp * 2
@@ -142,19 +179,23 @@ if _rocm_mxfp4_available:
         assert Kp == Kp2
         SCALE_BLOCK = 32
 
-        # Zero-init (not empty): rows past the last group offset (e.g. padding
-        # tokens) are never written by the kernel and must read back as 0, not
-        # uninitialized garbage (which can be NaN/inf and poison the loss).
+        # Zero-init (not empty): the token dim M is allocated to the dispatcher's
+        # padded capacity, which can exceed the last group offset (offs[-1]).
+        # Those trailing capacity-slack / padding rows belong to no expert group
+        # and are never written by the per-group grid; with torch.empty they
+        # retain uninitialized garbage (NaN/inf) that poisons gradients. Zero is
+        # the correct value (no token -> no contribution).
         output = torch.zeros((M, N), dtype=out_dtype, device=input_act.device)
 
-        # The M grid must cover the LARGEST group, not the average. MoE routing
-        # is imbalanced, so any single expert can receive up to M tokens; a grid
-        # bound of max_M_per_expert (= ceil(M/E)) leaves the tail of hot experts'
-        # groups uncomputed. Bound by M so cdiv(M, BLOCK_M) m-blocks cover every
-        # group; blocks past a group's end early-return via the m_base guard.
-        grid = (
-            triton.cdiv(M, BLOCK_M),
-            triton.cdiv(N, BLOCK_N),
+        # The M grid must cover the LARGEST group, not the average: MoE routing is
+        # imbalanced, so a single expert can receive up to M tokens. The default
+        # max_M_per_expert=0 bounds the grid by full M; blocks past a group's end
+        # early-return via the m_base guard. BLOCK_M/BLOCK_N come from the
+        # autotuner, so the grid is a function of the selected meta-parameters.
+        grid_m_bound = max_M_per_expert if max_M_per_expert > 0 else M
+        grid = lambda META: (
+            triton.cdiv(grid_m_bound, META["BLOCK_M"]),
+            triton.cdiv(N, META["BLOCK_N"]),
             E,
         )
 
@@ -168,14 +209,35 @@ if _rocm_mxfp4_available:
             output, output.stride(0), output.stride(1),
             group_end_offsets,
             M, N, K,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
             SCALE_BLOCK=SCALE_BLOCK,
-            num_warps=num_warps, num_stages=num_stages,
         )
         return output
 
     # ==================== Weight gradient grouped GEMM ====================
 
+    # Same starvation fix as the forward kernel. Here BLOCK_M is the reduction
+    # tile (over tokens); larger BLOCK_M / deeper pipelines feed the mfmas
+    # better. The kernel already masks the M (reduction) and N/K (output) dims,
+    # so any tile size is correct. Keyed on (N, K) — the output dims are static.
+    # BLOCK_M is the reduction tile (over tokens) — the analogue of the forward
+    # kernel's BLOCK_K and the main feed lever here. Keep the output tiles
+    # (BLOCK_N/BLOCK_K) at 128 for the same small-N reason as the forward kernel.
+    _WGRAD_CONFIGS = [
+        triton.Config(
+            {"BLOCK_N": bn, "BLOCK_K": bk, "BLOCK_M": bm},
+            num_warps=w,
+            num_stages=s,
+        )
+        for (bn, bk, bm, w, s) in [
+            (128, 128, 128, 8, 2),   # original default
+            (128, 128, 256, 8, 2),   # deeper reduction tile
+            (128, 128, 256, 4, 2),
+            (128, 256, 256, 8, 2),
+            (128, 128, 512, 8, 2),
+        ]
+    ]
+
+    @triton.autotune(configs=_WGRAD_CONFIGS, key=["N", "K"], warmup=50, rep=200)
     @triton.jit
     def _mxfp4_wgrad_kernel(
         # grad_output dim1-quantized: (N, M//2) packed uint8
@@ -236,14 +298,23 @@ if _rocm_mxfp4_available:
 
             mb_base = m_base // SCALE_BLOCK
             mb_offs = mb_base + tl.arange(0, SUB_PER_BLOCK_M)
+            # The scale window (SUB_PER_BLOCK_M blocks) can extend past the last
+            # valid M scale-block for the final group (and into capacity-slack
+            # rows). Without masking the M-block dim, tl.load reads out-of-bounds
+            # scale bytes; a garbage byte == 255 is the e8m0 Inf/NaN encoding, and
+            # dot_scaled then yields 0(masked data) * 2^NaN = NaN. Mask to the
+            # valid block count so OOB lanes load 127 (== 2^0); their data is
+            # already 0, so they contribute 0.
+            num_m_scale_blocks = M // SCALE_BLOCK
+            mb_valid = mb_offs < num_m_scale_blocks
 
             go_scale = tl.load(
                 GO_scales_ptr + n_offs[:, None] * GO_scales_stride_n + mb_offs[None, :] * GO_scales_stride_mb,
-                mask=n_mask[:, None], other=127,
+                mask=n_mask[:, None] & mb_valid[None, :], other=127,
             )
             ia_scale = tl.load(
                 IA_scales_ptr + k_offs[:, None] * IA_scales_stride_k + mb_offs[None, :] * IA_scales_stride_mb,
-                mask=k_mask[:, None], other=127,
+                mask=k_mask[:, None] & mb_valid[None, :], other=127,
             )
 
             acc = tl.dot_scaled(go_tile, go_scale, "e2m1", ia_tile, ia_scale, "e2m1", acc=acc, out_dtype=tl.float32)
@@ -261,16 +332,12 @@ if _rocm_mxfp4_available:
         ia_scale: torch.Tensor,      # (K, M//32) e8m0
         group_end_offsets: torch.Tensor,
         out_dtype: torch.dtype = torch.bfloat16,
-        BLOCK_N: int = 128,
-        BLOCK_K: int = 128,
-        BLOCK_M: int = 128,
-        num_warps: int = 8,
-        num_stages: int = 2,
     ) -> torch.Tensor:
         """
         MXFP4 weight gradient: grad_W[g] = grad_output[group_g]^T @ input_act[group_g]
 
         Both inputs must be dim1-quantized to fp4 (packed 2-per-byte).
+        Tile shape / pipeline depth are chosen by @triton.autotune (keyed on N, K).
         Returns (E, N, K) bf16.
         """
         N, Mp = go_t.shape
@@ -282,9 +349,10 @@ if _rocm_mxfp4_available:
 
         output = torch.empty((E, N, K), dtype=out_dtype, device=go_t.device)
 
-        grid = (
-            triton.cdiv(N, BLOCK_N),
-            triton.cdiv(K, BLOCK_K),
+        # BLOCK_N/BLOCK_K chosen by the autotuner -> grid is a function of META.
+        grid = lambda META: (
+            triton.cdiv(N, META["BLOCK_N"]),
+            triton.cdiv(K, META["BLOCK_K"]),
             E,
         )
 
@@ -298,9 +366,7 @@ if _rocm_mxfp4_available:
             output, output.stride(0), output.stride(1), output.stride(2),
             group_end_offsets,
             M, N, K,
-            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_M=BLOCK_M,
             SCALE_BLOCK=SCALE_BLOCK,
-            num_warps=num_warps, num_stages=num_stages,
         )
         return output
 
