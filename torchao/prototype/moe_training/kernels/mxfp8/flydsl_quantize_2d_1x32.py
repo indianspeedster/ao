@@ -53,8 +53,12 @@ if _flydsl_runtime_available():
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import buffer_ops, const_expr, range_constexpr
-    from flydsl.expr.vector import ReductionOp
+    # flydsl 0.3.0 deleted `flydsl.expr.buffer_ops` and `flydsl.expr.vector`.
+    # `_flydsl_ops` re-implements what these kernels use over ops that exist
+    # in BOTH versions -- see that module's header.
+    from flydsl.expr import const_expr, range_constexpr
+    from ._flydsl_ops import buffer_load, buffer_store, create_buffer_resource
+    from flydsl.expr import ReductionOp
 
     # Module-level imports of the in-kernel helpers — see flydsl_utils.py for
     # why this matters (cutedsl uses the same pattern with cute_utils).
@@ -98,9 +102,9 @@ if _flydsl_runtime_available():
             row = fx.block_idx.x
             tid = fx.thread_idx.x
 
-            x_rsrc = buffer_ops.create_buffer_resource(x)
-            q_rsrc = buffer_ops.create_buffer_resource(q)
-            s_rsrc = buffer_ops.create_buffer_resource(scales)
+            x_rsrc = create_buffer_resource(x)
+            q_rsrc = create_buffer_resource(q)
+            s_rsrc = create_buffer_resource(scales)
 
             if const_expr(not USE_RCEIL):
                 f8_min_v, f8_max_v = make_fp8_clamp_vectors()
@@ -111,7 +115,7 @@ if _flydsl_runtime_available():
                 local_amax = fx.Float32(0.0)
                 for c in range_constexpr(0, CHUNKS_PER_BLOCK):
                     off = elem_base + fx.Int32(c * VEC)
-                    vec_in = buffer_ops.buffer_load(
+                    vec_in = buffer_load(
                         x_rsrc, off, vec_width=VEC, dtype=in_dtype
                     )
                     vec_f32 = vec_in.to(fx.Float32)
@@ -135,9 +139,9 @@ if _flydsl_runtime_available():
                             chunks[c], scale_arg, f8_min_v, f8_max_v
                         )
                     i32_off = (elem_base + fx.Int32(c * VEC)) // fx.Int32(VEC)
-                    buffer_ops.buffer_store(out, q_rsrc, i32_off)
+                    buffer_store(out, q_rsrc, i32_off)
 
-                buffer_ops.buffer_store(
+                buffer_store(
                     scale_u8,
                     s_rsrc,
                     row * fx.Int32(K_BLOCKS) + block_in_row,

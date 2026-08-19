@@ -93,7 +93,16 @@ if _flydsl_runtime_available():
     from flydsl._mlir.dialects.rocdl import (
         cvt_scalef32_pk_fp8_f32 as _scaled_cvt_pk_fp8_f32,
     )
-    from flydsl.expr import arith, rocdl, vector
+    # flydsl 0.3.0 deleted `flydsl.expr.buffer_ops` and `flydsl.expr.vector`.
+    # `_flydsl_ops` re-implements what these kernels use over ops that exist
+    # in BOTH versions -- see that module's header.
+    from flydsl.expr import arith, rocdl
+    from ._flydsl_ops import (
+        vec_bitcast,
+        vec_broadcast,
+        vec_extract,
+        vec_from_elements,
+    )
     from flydsl.expr.arith import ArithValue
     from flydsl.expr.typing import T
 
@@ -216,8 +225,8 @@ if _flydsl_runtime_available():
             clamp before the FP8 conversion (FLOOR mode).
         """
         f32x4 = T.vec(VEC, T.f32)
-        f8_min = vector.broadcast(f32x4, arith.unwrap(fx.Float32(-F8_MAX)))
-        f8_max = vector.broadcast(f32x4, arith.unwrap(fx.Float32(F8_MAX)))
+        f8_min = vec_broadcast(f32x4, arith.unwrap(fx.Float32(-F8_MAX)))
+        f8_max = vec_broadcast(f32x4, arith.unwrap(fx.Float32(F8_MAX)))
         return f8_min, f8_max
 
     def quantize_pack_chunk_to_i32_rceil(chunk_f32, pos_scale):
@@ -235,13 +244,13 @@ if _flydsl_runtime_available():
         Returns:
             i32 ArithValue with bytes ``[qv0, qv1, qv2, qv3]`` (low to high).
         """
-        qv0 = vector.extract(chunk_f32, static_position=[0], dynamic_position=[])
-        qv1 = vector.extract(chunk_f32, static_position=[1], dynamic_position=[])
-        qv2 = vector.extract(chunk_f32, static_position=[2], dynamic_position=[])
-        qv3 = vector.extract(chunk_f32, static_position=[3], dynamic_position=[])
+        qv0 = vec_extract(chunk_f32, static_position=[0], dynamic_position=[])
+        qv1 = vec_extract(chunk_f32, static_position=[1], dynamic_position=[])
+        qv2 = vec_extract(chunk_f32, static_position=[2], dynamic_position=[])
+        qv3 = vec_extract(chunk_f32, static_position=[3], dynamic_position=[])
         v2i16 = T.vec(2, T.i16)
         zero_i16 = arith.unwrap(fx.Int16(0))
-        r = vector.from_elements(v2i16, [zero_i16, zero_i16])
+        r = vec_from_elements(v2i16, [zero_i16, zero_i16])
         r = _scaled_cvt_pk_fp8_f32(
             res=v2i16,
             old_vdst=r,
@@ -258,8 +267,8 @@ if _flydsl_runtime_available():
             scale=arith.unwrap(pos_scale),
             dst_lo_hi_sel=True,
         )
-        r_v1i32 = vector.bitcast(T.vec(1, T.i32), r)
-        return vector.extract(r_v1i32, static_position=[0], dynamic_position=[])
+        r_v1i32 = vec_bitcast(T.vec(1, T.i32), r)
+        return vec_extract(r_v1i32, static_position=[0], dynamic_position=[])
 
     def quantize_pack_chunk_to_i32_floor(chunk_f32, inv_scale, f8_min_vec, f8_max_vec):
         """FLOOR mode: quantize 4 f32 → 4 FP8 E4M3FN packed into one i32.
@@ -276,10 +285,10 @@ if _flydsl_runtime_available():
         qv = chunk_f32 * inv_scale
         qv = arith.maximumf(qv, f8_min_vec)
         qv = arith.minimumf(qv, f8_max_vec)
-        qv0 = vector.extract(qv, static_position=[0], dynamic_position=[])
-        qv1 = vector.extract(qv, static_position=[1], dynamic_position=[])
-        qv2 = vector.extract(qv, static_position=[2], dynamic_position=[])
-        qv3 = vector.extract(qv, static_position=[3], dynamic_position=[])
+        qv0 = vec_extract(qv, static_position=[0], dynamic_position=[])
+        qv1 = vec_extract(qv, static_position=[1], dynamic_position=[])
+        qv2 = vec_extract(qv, static_position=[2], dynamic_position=[])
+        qv3 = vec_extract(qv, static_position=[3], dynamic_position=[])
         out = arith.unwrap(fx.Int32(0))
         out = rocdl.cvt_pk_fp8_f32(
             res=T.i32, src_a=qv0, src_b=qv1, old=out, word_sel=False

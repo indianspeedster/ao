@@ -102,10 +102,20 @@ if _flydsl_runtime_available():
     import flydsl.expr as fx
     from flydsl._mlir import ir
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+    # flydsl 0.3.0 deleted `flydsl.expr.buffer_ops` and `flydsl.expr.vector`.
+    # `_flydsl_ops` re-implements what these kernels use over ops that exist
+    # in BOTH versions -- see that module's header.
+    from flydsl.expr import arith, const_expr, gpu, range_constexpr
+    from ._flydsl_ops import (
+        buffer_load,
+        buffer_store,
+        create_buffer_resource,
+        vec_extract,
+        vec_from_elements,
+    )
     from flydsl.expr.arith import ArithValue
     from flydsl.expr.typing import T
-    from flydsl.expr.vector import ReductionOp
+    from flydsl.expr import ReductionOp
     from flydsl.runtime.device import get_rocm_arch
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
@@ -168,9 +178,9 @@ if _flydsl_runtime_available():
             wave_id = tid // fx.Int32(AMD_WAVE_SIZE)
             lane_id = tid % fx.Int32(AMD_WAVE_SIZE)
 
-            x_rsrc = buffer_ops.create_buffer_resource(x)
-            q_rsrc = buffer_ops.create_buffer_resource(q)
-            s_rsrc = buffer_ops.create_buffer_resource(scales)
+            x_rsrc = create_buffer_resource(x)
+            q_rsrc = create_buffer_resource(q)
+            s_rsrc = create_buffer_resource(scales)
 
             # 4 waves cooperate on one (M_TILE, K_TILE) = (128, 256) tile
             # sharing this 64 KB LDS region; each wave owns a 32-row strip.
@@ -199,7 +209,7 @@ if _flydsl_runtime_available():
                     g_off = (row_base + wave_row_off + fx.Int32(i)) * fx.Int32(
                         K
                     ) + k_lane_base
-                    vec_in = buffer_ops.buffer_load(
+                    vec_in = buffer_load(
                         x_rsrc,
                         g_off,
                         vec_width=VEC,
@@ -209,7 +219,7 @@ if _flydsl_runtime_available():
                         T.index
                     )
                     for j in range_constexpr(0, VEC):
-                        elem = vector.extract(vec_in, static_position=[j])
+                        elem = vec_extract(vec_in, static_position=[j])
                         lds_col_idx = ArithValue(
                             lane_id * fx.Int32(VEC) + fx.Int32(j)
                         ).index_cast(T.index)
@@ -237,10 +247,10 @@ if _flydsl_runtime_available():
                             ).index_cast(T.index)
                             elems.append(lds_full.load([row_lds_idx, lds_col_idx]))
                         if const_expr(input_dtype_name == "torch.bfloat16"):
-                            vec_in = vector.from_elements(T.vec(VEC, T.bf16), elems)
+                            vec_in = vec_from_elements(T.vec(VEC, T.bf16), elems)
                             vec_f32 = arith.extf(T.vec(VEC, T.f32), vec_in)
                         else:
-                            vec_f32 = vector.from_elements(T.vec(VEC, T.f32), elems)
+                            vec_f32 = vec_from_elements(T.vec(VEC, T.f32), elems)
                         chunks.append(vec_f32)
                         local_amax = local_amax.maximumf(
                             fx.math.absf(vec_f32).reduce(ReductionOp.MAX)
@@ -261,9 +271,9 @@ if _flydsl_runtime_available():
                             out = quantize_pack_chunk_to_i32_floor(
                                 chunks[c], scale_arg, f8_min_v, f8_max_v
                             )
-                        buffer_ops.buffer_store(out, q_rsrc, col_i32_base + fx.Int32(c))
+                        buffer_store(out, q_rsrc, col_i32_base + fx.Int32(c))
 
-                    buffer_ops.buffer_store(
+                    buffer_store(
                         scale_u8,
                         s_rsrc,
                         k_col_global * fx.Int32(M // BLOCK_SIZE) + m_block_global,

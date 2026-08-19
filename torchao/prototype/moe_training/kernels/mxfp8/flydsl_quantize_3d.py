@@ -77,10 +77,20 @@ if _flydsl_runtime_available():
     import flydsl.expr as fx
     from flydsl._mlir import ir
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+    # flydsl 0.3.0 deleted `flydsl.expr.buffer_ops` and `flydsl.expr.vector`.
+    # `_flydsl_ops` re-implements what these kernels use over ops that exist
+    # in BOTH versions -- see that module's header.
+    from flydsl.expr import arith, const_expr, gpu, range_constexpr
+    from ._flydsl_ops import (
+        buffer_load,
+        buffer_store,
+        create_buffer_resource,
+        vec_extract,
+        vec_from_elements,
+    )
     from flydsl.expr.arith import ArithValue
     from flydsl.expr.typing import T
-    from flydsl.expr.vector import ReductionOp
+    from flydsl.expr import ReductionOp
     from flydsl.runtime.device import get_rocm_arch
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
@@ -170,9 +180,9 @@ if _flydsl_runtime_available():
             wave_id = tid // fx.Int32(AMD_WAVE_SIZE)
             lane_id = tid % fx.Int32(AMD_WAVE_SIZE)
 
-            x_rsrc = buffer_ops.create_buffer_resource(x)
-            q_rsrc = buffer_ops.create_buffer_resource(q)
-            s_rsrc = buffer_ops.create_buffer_resource(scales)
+            x_rsrc = create_buffer_resource(x)
+            q_rsrc = create_buffer_resource(q)
+            s_rsrc = create_buffer_resource(scales)
 
             # Wave i owns LDS rows [i*BLOCK_SIZE, (i+1)*BLOCK_SIZE) of one
             # shared (BLOCK_SIZE * waves_per_block, _K_TILE) region.
@@ -202,7 +212,7 @@ if _flydsl_runtime_available():
                         + (row_base + fx.Int32(i)) * fx.Int32(K)
                         + k_lane_base
                     )
-                    vec_in = buffer_ops.buffer_load(
+                    vec_in = buffer_load(
                         x_rsrc,
                         g_off,
                         vec_width=VEC,
@@ -212,7 +222,7 @@ if _flydsl_runtime_available():
                         T.index
                     )
                     for j in range_constexpr(0, VEC):
-                        elem = vector.extract(vec_in, static_position=[j])
+                        elem = vec_extract(vec_in, static_position=[j])
                         lds_col_idx = ArithValue(
                             lane_id * fx.Int32(VEC) + fx.Int32(j)
                         ).index_cast(T.index)
@@ -260,10 +270,10 @@ if _flydsl_runtime_available():
                         ).index_cast(T.index)
                         elems.append(lds_full.load([row_lds_idx, lds_col_idx]))
                     if const_expr(input_dtype_name == "torch.bfloat16"):
-                        vec_bf = vector.from_elements(T.vec(VEC, T.bf16), elems)
+                        vec_bf = vec_from_elements(T.vec(VEC, T.bf16), elems)
                         vec_f32 = arith.extf(T.vec(VEC, T.f32), vec_bf)
                     else:
-                        vec_f32 = vector.from_elements(T.vec(VEC, T.f32), elems)
+                        vec_f32 = vec_from_elements(T.vec(VEC, T.f32), elems)
                     chunks_local.append(vec_f32)
                     amax_local = amax_local.maximumf(
                         fx.math.absf(vec_f32).reduce(ReductionOp.MAX)
@@ -290,7 +300,7 @@ if _flydsl_runtime_available():
                         out = quantize_pack_chunk_to_i32_floor(
                             chunks_local[c], scale_arg, f8_min_v, f8_max_v
                         )
-                    buffer_ops.buffer_store(
+                    buffer_store(
                         out,
                         q_rsrc,
                         col_i32_base + fx.Int32(c),
@@ -316,7 +326,7 @@ if _flydsl_runtime_available():
                         + b32 * fx.Int32(4)
                         + col_in4
                     )
-                    buffer_ops.buffer_store(scale_u8, s_rsrc, blocked_off)
+                    buffer_store(scale_u8, s_rsrc, blocked_off)
                 else:
                     # (32, 1): each (lane, k_local) writes its own scale.
                     # (32, 32): all 8 lanes × VEC k_local in a K-block hold
@@ -327,7 +337,7 @@ if _flydsl_runtime_available():
                         if const_expr(scale_block_k == 1)
                         else k_col_global // fx.Int32(BLOCK_SIZE)
                     )
-                    buffer_ops.buffer_store(
+                    buffer_store(
                         scale_u8,
                         s_rsrc,
                         expert * fx.Int32(SCALES_PER_EXPERT)
